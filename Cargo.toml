@@ -1,0 +1,12 @@
+[package]
+name = "async-selector"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/Razz4780/async-selector"
+
+[dependencies]
+futures = "0.3"
+
+[dev-dependencies]
+rstest = "0.26"
+tokio = { version = "1", features = ["full"] }

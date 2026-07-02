@@ -3,6 +3,7 @@ name = "async-selector"
 version = "0.1.0"
 edition = "2024"
 readme = "README.md"
+license = "MIT"
 repository = "https://github.com/Razz4780/async-selector"
 authors = ["Michał Smolarek <msmolarekg@gmail.com>"]
 description = "Fast and flexible asynchronous task selector"

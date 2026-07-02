@@ -13,9 +13,10 @@
 //! Simply flatten a set of streams:
 //!
 //! ```
+//! # use async_selector::StreamSelector;
 //! # use futures::{StreamExt, channel::mpsc};
-//! # use crate::StreamSelector;
-//! # async fn flatten() {
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() {
 //! let mut selector = StreamSelector::default();
 //! (0..5).for_each(|i| {
 //!     let (tx, rx) = mpsc::unbounded();
@@ -25,7 +26,7 @@
 //! let collected = selector.collect::<Vec<_>>().await;
 //! assert_eq!(
 //!     collected,
-//!     vec![0, 1, 2, 3],
+//!     vec![0, 1, 2, 3, 4],
 //! );
 //! # }
 //! ```
@@ -33,9 +34,10 @@
 //! Use as a map of streams:
 //!
 //! ```
+//! # use async_selector::StreamSelector;
 //! # use futures::{SinkExt, StreamExt, channel::mpsc};
-//! # use crate::StreamSelector;
-//! # async fn select_with_id() {
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() {
 //! let mut selector = StreamSelector::default();
 //! let txs = (0..10)
 //!     .map(|_| {

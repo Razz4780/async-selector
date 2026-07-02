@@ -10,7 +10,7 @@ use crate::{
     mpsc::{QueueLink, StoredInQueue, WeakSender},
 };
 
-/// Wrapper for the pollable task stored in a [`Selector`](crate::selector::Selector).
+/// Wrapper for the pollable tasks stored in a [`Selector`](crate::selector::Selector).
 ///
 /// Meant to be passed around in [`Arc`].
 pub struct Task<P> {
@@ -21,11 +21,14 @@ pub struct Task<P> {
     /// State owned by the list of all tasks.
     ///
     /// This is where the task is stored.
+    /// We never move this value, and the tasks are always stored on heap.
+    /// `P` can be safely polled, even if it's not [`Unpin`].
     list_protected: ListProtected<Self>,
 }
 
 impl<P> Task<P> {
-    pub fn new(ready_tx: WeakSender<Self>) -> Self {
+    /// Creates an empty task that has no `P`.
+    pub fn empty(ready_tx: WeakSender<Self>) -> Self {
         Self {
             ready_tx,
             queue_link: Default::default(),
@@ -105,6 +108,7 @@ unsafe impl<P> StoredInList for Task<P> {
     }
 }
 
+/// Borrowed [`Waker`] for a specific [`Task`].
 pub struct WakerRef<'a, P> {
     /// We don't actually own the waker.
     ///

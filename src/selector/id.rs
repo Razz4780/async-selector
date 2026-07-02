@@ -1,5 +1,7 @@
 use std::{
+    cmp::Ordering,
     fmt,
+    hash::{Hash, Hasher},
     mem::ManuallyDrop,
     sync::{Arc, Weak},
 };
@@ -10,6 +12,9 @@ use crate::{
 };
 
 /// A unique id of a task stored in a [`Selector`](crate::selector::Selector).
+///
+/// See [example](https://github.com/Razz4780/async-selector/blob/main/examples/map.rs)
+/// of how it can be leverage to use the selector like a map.
 ///
 /// Mind that this keeping this id alive prevents the selector
 /// from deallocating memory used to store the task.
@@ -24,9 +29,9 @@ pub struct Id {
 }
 
 impl Id {
-    pub(super) fn new<P>(node: &Arc<Task<P>>) -> Self {
-        let sender_ptr = node.ready_tx().clone().into_raw().cast();
-        let task_ptr = Arc::downgrade(node).into_raw().cast();
+    pub(super) fn new<P>(task: Weak<Task<P>>, sender: WeakSender<Task<P>>) -> Self {
+        let sender_ptr = sender.into_raw().cast();
+        let task_ptr = task.into_raw().cast();
         Self {
             sender_ptr,
             task_ptr,
@@ -66,9 +71,35 @@ impl Drop for Id {
 impl fmt::Debug for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Id")
-            .field("parent", &self.sender_ptr)
             .field("task", &self.task_ptr)
+            .field("selector", &self.sender_ptr)
             .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Id {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.task_ptr, other.task_ptr)
+    }
+}
+
+impl Eq for Id {}
+
+impl Hash for Id {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::ptr::hash(self.task_ptr, state);
+    }
+}
+
+impl PartialOrd for Id {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Id {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.task_ptr.cmp(&other.task_ptr)
     }
 }
 

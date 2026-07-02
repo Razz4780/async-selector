@@ -2,7 +2,13 @@
 name = "async-selector"
 version = "0.1.0"
 edition = "2024"
+readme = "README.md"
 repository = "https://github.com/Razz4780/async-selector"
+authors = ["Michał Smolarek <msmolarekg@gmail.com>"]
+description = "Fast and flexible asynchronous task selector"
+publish = true
+keywords = ["async", "concurrency"]
+categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 futures = "0.3"

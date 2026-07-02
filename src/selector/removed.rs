@@ -1,6 +1,7 @@
 use std::{
     ops::{Deref, DerefMut},
     pin::Pin,
+    sync::Arc,
 };
 
 use crate::{list, selector::Id, task::Task};
@@ -14,7 +15,8 @@ pub struct Removed<P>(pub(super) list::Removed<Task<P>>);
 impl<P> Removed<P> {
     /// Returns the id of this task.
     pub fn id(&self) -> Id {
-        Id::new(self.0.node())
+        let node = self.0.node();
+        Id::new(Arc::downgrade(node), node.ready_tx().clone())
     }
 
     /// Returns a pinned reference to the task.

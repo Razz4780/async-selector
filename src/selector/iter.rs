@@ -129,7 +129,6 @@ impl<P> DoubleEndedIterator for IntoIter<P> {
 /// Iterator which uses a closure to determine if a task should be removed from a [`Selector`](crate::selector::Selector).
 ///
 /// If the closure returns true, the task is removed from the selector and yielded.
-/// If the closure returns false, or panics, the element remains in the task and will not be yielded.
 ///
 /// If the iterator is not exhausted, e.g. because it is dropped without iterating or the iteration short-circuits,
 /// then the remaining tasks will be retained.

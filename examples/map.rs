@@ -11,6 +11,8 @@ use async_selector::{
 };
 use futures::{FutureExt, Stream, StreamExt, channel::mpsc};
 
+/// This example shows how [`Id`]s can be used to build
+/// a simple [`Stream`](futures::Stream) hashmap on top of a [`StreamSelector`].
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut map = StreamMap::default();
@@ -37,6 +39,11 @@ async fn main() {
     assert!(senders[4].is_closed());
 }
 
+/// Combined [`StreamSelector`] and a [`HashMap`] that allows for accessing the streams by generic key.
+///
+/// # Note
+///
+/// This data structure might not be optimal, as the keys are cloned a lot.
 struct StreamMap<K: Clone + Unpin, S: Stream> {
     selector: StreamSelector<NotifyEnd<S, K>>,
     keys: HashMap<K, Id>,
@@ -62,8 +69,8 @@ where
     }
 
     pub fn remove(&mut self, key: &K) -> Option<Removed<NotifyEnd<S, K>>> {
-        let id = self.keys.get(key)?;
-        self.selector.remove(id)
+        let id = self.keys.remove(key)?;
+        self.selector.remove(&id)
     }
 }
 

@@ -226,43 +226,17 @@ impl<T: StoredInQueue> Queue<T> {
 
 impl<T: StoredInQueue> Drop for Queue<T> {
     fn drop(&mut self) {
-        struct DestroyOnDrop<T: StoredInQueue> {
-            stub: *const T,
-            node: *mut T,
-        }
+        struct DestroyOnDrop<'a, T: StoredInQueue>(&'a Queue<T>);
 
-        impl<T: StoredInQueue> Drop for DestroyOnDrop<T> {
+        impl<T: StoredInQueue> Drop for DestroyOnDrop<'_, T> {
             fn drop(&mut self) {
-                let mut inner_guard = DestroyOnDrop {
-                    stub: self.stub,
-                    node: self.node,
-                };
-
-                while inner_guard.node.is_null().not() {
-                    let node = inner_guard.node;
-                    inner_guard.node = unsafe {
-                        // SAFETY: we have a mutable reference to the queue,
-                        // no other thread is accessing the links.
-                        *node
-                            .as_ref_unchecked()
-                            .queue_link()
-                            .next
-                            .as_ptr()
-                            .as_ref_unchecked()
-                    };
-                    if std::ptr::eq(node, inner_guard.stub).not() {
-                        let _ = unsafe { Arc::from_raw(node) };
-                    }
-                }
-
+                let inner_guard = DestroyOnDrop(self.0);
+                while unsafe { self.0.dequeue().is_some() } {}
                 let _ = ManuallyDrop::new(inner_guard);
             }
         }
 
-        DestroyOnDrop {
-            stub: &self.stub,
-            node: *self.tail.get_mut(),
-        };
+        DestroyOnDrop(self);
     }
 }
 

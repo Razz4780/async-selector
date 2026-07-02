@@ -1,6 +1,7 @@
 use std::{
     ops::{Deref, DerefMut},
     pin::Pin,
+    sync::Arc,
 };
 
 use crate::{
@@ -25,7 +26,8 @@ impl<P> Borrowed<'_, P> {
 
     /// Returns the id of this task.
     pub fn id(&self) -> Id {
-        Id::new(self.node.node())
+        let node = self.node.node();
+        Id::new(Arc::downgrade(node), node.ready_tx().clone())
     }
 }
 
@@ -54,7 +56,8 @@ impl<P> BorrowedMut<'_, P> {
 
     /// Returns the id of this task.
     pub fn id(&self) -> Id {
-        Id::new(self.node.node())
+        let node = self.node.node();
+        Id::new(Arc::downgrade(node), node.ready_tx().clone())
     }
 
     /// Returns a pinned reference to the task.

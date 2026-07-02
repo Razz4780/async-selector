@@ -16,6 +16,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+/// This example shows how a manual implementation of [`PollWith`] can be leveraged
+/// to make the [`Selector`] more flexible with [`PollWith::poll_progress`] extensions.
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -42,7 +44,7 @@ async fn main() {
 
             conn = listener.accept() => {
                 let (stream, addr) = conn.unwrap();
-                println!("Accepted a new connection from {addr}");
+                println!("Accepted a new connection from {addr}, polling the task's read");
                 selector.push(TcpStreamHandler {
                     peer_addr: addr,
                     stream,
@@ -54,10 +56,17 @@ async fn main() {
                 tokio::spawn(send_data(addr));
             },
 
-            _ = &mut stop => break,
+            _ = &mut stop => {
+                println!("Timeout elapsed, now polling all tasks' shutdown.");
+                break;
+            }
         }
     }
 
+    // In this example, before polling with a different extension,
+    // we need to manually wake all tasks.
+    // This is because previous poll left them waiting for incoming data.
+    // Selector will not poll the task until it receives a wakeup.
     selector.wake_all();
 
     while selector
@@ -124,51 +133,41 @@ impl PollStrategy for Strategy {
 }
 
 impl<'a> PollWith<'a, (), Vec<u8>> for Strategy {
-    type Item = io::Result<(SocketAddr, Vec<u8>)>;
     type Progress = io::Result<(SocketAddr, Vec<u8>)>;
 
+    /// Thanks to the mutable extension, all handlers can read data into single a shared buffer.
+    ///
+    /// No synchronization or unsafe code required.
     fn poll_progress(
         state: Pin<&mut Self::Pollable>,
         _: &(),
         recv_buf: &mut Vec<u8>,
         cx: &mut Context<'_>,
-    ) -> Poll<Self::Progress> {
+    ) -> Poll<ControlFlow<Option<Self::Progress>, Self::Progress>> {
         let this = state.get_mut();
-        let data = std::task::ready!(this.poll_read(recv_buf, cx))?;
-        Poll::Ready(Ok((this.peer_addr, data)))
-    }
-
-    fn try_unwrap(
-        &mut self,
-        output: Self::Progress,
-    ) -> ControlFlow<Option<Self::Item>, Self::Item> {
-        match output {
-            Ok((addr, data)) if data.is_empty() => ControlFlow::Break(Some(Ok((addr, data)))),
-            Ok((addr, data)) => ControlFlow::Continue(Ok((addr, data))),
+        let output = match std::task::ready!(this.poll_read(recv_buf, cx)) {
+            Ok(data) if data.is_empty() => ControlFlow::Break(Some(Ok((this.peer_addr, data)))),
+            Ok(data) => ControlFlow::Continue(Ok((this.peer_addr, data))),
             Err(error) => ControlFlow::Break(Some(Err(error))),
-        }
+        };
+        Poll::Ready(output)
     }
 }
 
 impl<'a> PollWith<'a, [u8], ()> for Strategy {
-    type Item = io::Result<SocketAddr>;
     type Progress = io::Result<SocketAddr>;
 
+    /// Thanks to the mutable extension, all handlers have access to the goodbye message,
+    /// while [`TcpStreamHandler`] type remains `'static`.
     fn poll_progress(
         state: Pin<&mut Self::Pollable>,
         goodbye_message: &[u8],
         _: &mut (),
         cx: &mut Context<'_>,
-    ) -> Poll<Self::Progress> {
+    ) -> Poll<ControlFlow<Option<Self::Progress>, Self::Progress>> {
         let this = state.get_mut();
-        std::task::ready!(this.poll_shutdown(goodbye_message, cx))?;
-        Poll::Ready(Ok(this.peer_addr))
-    }
-
-    fn try_unwrap(
-        &mut self,
-        output: Self::Progress,
-    ) -> ControlFlow<Option<Self::Item>, Self::Item> {
-        ControlFlow::Break(Some(output))
+        let output =
+            std::task::ready!(this.poll_shutdown(goodbye_message, cx)).map(|_| this.peer_addr);
+        Poll::Ready(ControlFlow::Break(Some(output)))
     }
 }

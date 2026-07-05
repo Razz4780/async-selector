@@ -12,7 +12,7 @@ use async_selector::{
 use futures::{FutureExt, Stream, StreamExt, channel::mpsc};
 
 /// This example shows how [`Id`]s can be used to build
-/// a simple [`Stream`](futures::Stream) hashmap on top of a [`StreamSelector`].
+/// a simple [`Stream`] hashmap on top of a [`StreamSelector`].
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut map = StreamMap::default();

@@ -9,7 +9,7 @@ use std::{
 use futures::Stream;
 
 use crate::{
-    pollable::{PollStrategy, PollWith},
+    pollable::PollProxy,
     selector::{Id, Selector},
 };
 
@@ -19,20 +19,19 @@ use crate::{
 /// Created with [`Selector::with_ext`].
 ///
 /// **Important:** before polling the tasks with different extension types, see the wakeups [section](Selector#wakeups).
-pub struct WithExt<'s, 'e, 'emut, S: PollStrategy, E: ?Sized, EMut: ?Sized> {
-    pub(super) selector: &'s mut Selector<S>,
+pub struct WithExt<'s, 'e, 'emut, T, P, E: ?Sized, EMut: ?Sized> {
+    pub(super) selector: &'s mut Selector<T, P>,
     pub(super) ext: &'e E,
     pub(super) ext_mut: &'emut mut EMut,
 }
 
-impl<'e, S, E, EMut> Stream for WithExt<'_, 'e, '_, S, E, EMut>
+impl<'e, T, P, E, EMut> Stream for WithExt<'_, 'e, '_, T, P, E, EMut>
 where
-    S: PollStrategy,
-    S: PollWith<'e, E, EMut>,
+    P: PollProxy<'e, T, E, EMut>,
     E: ?Sized,
     EMut: ?Sized,
 {
-    type Item = S::Progress;
+    type Item = P::Progress;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -45,16 +44,15 @@ where
 /// Borrowed [`Stream`] that will poll the inner [`Selector`] and attach the origin task [`Id`] to every item.
 ///
 /// Created with [`Selector::with_id`].
-pub struct WithId<'s, S: PollStrategy> {
-    pub(super) selector: &'s mut Selector<S>,
+pub struct WithId<'s, T, P> {
+    pub(super) selector: &'s mut Selector<T, P>,
 }
 
-impl<S> Stream for WithId<'_, S>
+impl<T, P> Stream for WithId<'_, T, P>
 where
-    S: PollStrategy,
-    S: PollWith<'static, (), ()>,
+    P: PollProxy<'static, T, (), ()>,
 {
-    type Item = (S::Progress, Id<S::Pollable>);
+    type Item = (P::Progress, Id<T>);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.get_mut()
@@ -69,20 +67,19 @@ where
 /// Created with [`Selector::with_ext_and_id`].
 ///
 /// **Important:** before polling the tasks with different extension types, see the wakeups [section](Selector#wakeups).
-pub struct WithExtAndId<'s, 'e, 'emut, S: PollStrategy, E: ?Sized, EMut: ?Sized> {
-    pub(super) selector: &'s mut Selector<S>,
+pub struct WithExtAndId<'s, 'e, 'emut, T, P, E: ?Sized, EMut: ?Sized> {
+    pub(super) selector: &'s mut Selector<T, P>,
     pub(super) ext: &'e E,
     pub(super) ext_mut: &'emut mut EMut,
 }
 
-impl<'e, S, E, EMut> Stream for WithExtAndId<'_, 'e, '_, S, E, EMut>
+impl<'e, T, P, E, EMut> Stream for WithExtAndId<'_, 'e, '_, T, P, E, EMut>
 where
-    S: PollStrategy,
-    S: PollWith<'e, E, EMut>,
+    P: PollProxy<'e, T, E, EMut>,
     E: ?Sized,
     EMut: ?Sized,
 {
-    type Item = (S::Progress, Id<S::Pollable>);
+    type Item = (P::Progress, Id<T>);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();

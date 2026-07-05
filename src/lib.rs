@@ -5,7 +5,7 @@
 //!
 //! Allows for:
 //! 1. Polling multiple tasks concurrently on the same thread
-//! 2. Safely injecting shared state into polling logic (see [`PollWith`](crate::pollable::PollWith))
+//! 2. Safely injecting shared state into polling logic (see [`Pollable`](crate::pollable::Pollable))
 //! 3. Accessing and removing the tasks by automatically assigned unique ids
 //!
 //! # Examples
@@ -56,10 +56,10 @@
 //!
 //! More examples live [here](https://github.com/Razz4780/async-selector/tree/main/examples).
 
-#![deny(missing_docs, unused_crate_dependencies)]
+#![deny(unused_crate_dependencies)]
 
 use crate::{
-    pollable::{PollAsFuture, PollAsStream},
+    pollable::{PollFuture, PollStream},
     selector::Selector,
 };
 
@@ -72,8 +72,8 @@ mod task;
 /// [`Selector`] specialized for polling [`Future`]s.
 ///
 /// Behaves much like [`FuturesUnordered`](futures::stream::FuturesUnordered).
-pub type FutureSelector<F> = Selector<PollAsFuture<F>>;
+pub type FutureSelector<F> = Selector<F, PollFuture>;
 /// [`Selector`] specialized for polling [`Stream`](futures::stream::Stream)s.
 ///
 /// Behaves much like [`SelectAll`](futures::stream::SelectAll).
-pub type StreamSelector<S> = Selector<PollAsStream<S>>;
+pub type StreamSelector<S> = Selector<S, PollStream>;

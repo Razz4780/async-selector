@@ -4,7 +4,6 @@
 //! You can use plain [`FutureSelector`](crate::FutureSelector) and [`StreamSelector`](crate::StreamSelector).
 
 use std::{
-    marker::PhantomData,
     ops::ControlFlow,
     pin::Pin,
     task::{Context, Poll},
@@ -12,38 +11,16 @@ use std::{
 
 use futures::Stream;
 
-/// Determines the type of pollable task that can be stored in a [`Selector`](crate::selector::Selector).
-///
-/// This trait exists solely to enable non-conflicting blanket implementations for [`Future`]s and [`Stream`]s.
-pub trait PollStrategy {
-    /// Type of the task that will be stored in the [`Selector`](crate::selector::Selector).
-    type Pollable;
-}
-
-/// Marker trait that allows for a blanket implementation of [`PollWith`] on all [`Future`]s.
-pub struct PollAsFuture<F>(PhantomData<fn() -> F>);
-
-impl<F: Future> PollStrategy for PollAsFuture<F> {
-    type Pollable = F;
-}
-
-/// Marker trait that allows for a blanket implementation of [`PollWith`] on all [`Stream`]s.
-pub struct PollAsStream<S>(PhantomData<fn() -> S>);
-
-impl<S: Stream> PollStrategy for PollAsStream<S> {
-    type Pollable = S;
-}
-
-/// Determines how the [`Selector`](crate::selector::Selector) polls the tasks and interprets their outputs.
-pub trait PollWith<'a, E: ?Sized, EMut: ?Sized>: PollStrategy {
+/// Task that can be polled inside a [`Selector`](crate::selector::Selector).
+pub trait Pollable<'a, E: ?Sized, EMut: ?Sized> {
     /// Type of values returned when polling the task.
     type Progress;
 
-    /// Polls the given task, providing references to strongly typed extensions.
+    /// Polls the given task with references to strongly typed extensions.
     ///
     /// # Extensions
     ///
-    /// This method supports passing references to immutable and immutable extensions
+    /// This method supports passing references to immutable and mutable extensions
     /// that can be used by the task. This allows the tasks for operating on a shared state
     /// without any unsafe code or synchronization primitives.
     /// Even more, extensions allow for static polymorphism in the types returned by the task.
@@ -51,21 +28,41 @@ pub trait PollWith<'a, E: ?Sized, EMut: ?Sized>: PollStrategy {
     ///
     /// # Returns
     ///
-    /// * `ControlFlow::Continue` if the task has not finished and might yield more values
-    /// * `ControlFlow::Break` if the task has finished
+    /// * [`ControlFlow::Continue`] if the task has not finished and might yield more values
+    /// * [`ControlFlow::Break`] if the task has finished
     fn poll_progress(
-        state: Pin<&mut Self::Pollable>,
+        self: Pin<&mut Self>,
         ext: &'a E,
         ext_mut: &mut EMut,
         cx: &mut Context<'_>,
     ) -> Poll<ControlFlow<Option<Self::Progress>, Self::Progress>>;
 }
 
-impl<'a, F: Future> PollWith<'a, (), ()> for PollAsFuture<F> {
+/// Sealed complementary trait used internally by [`Selector`](crate::selector::Selector).
+///
+/// Allows for handling plain [`Future`]s and [`Stream`]s as [`Pollable`]s through [`PollFuture`] and [`PollStream`].
+pub trait PollProxy<'a, P, E: ?Sized, EMut: ?Sized>: sealed::Sealed {
+    type Progress;
+
+    fn poll_progress(
+        state: Pin<&mut P>,
+        ext: &'a E,
+        ext_mut: &mut EMut,
+        cx: &mut Context<'_>,
+    ) -> Poll<ControlFlow<Option<Self::Progress>, Self::Progress>>;
+}
+
+/// [`PollProxy`] that transforms [`Future`]s into [`Pollable`] tasks.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PollFuture;
+
+impl sealed::Sealed for PollFuture {}
+
+impl<'a, F: Future> PollProxy<'a, F, (), ()> for PollFuture {
     type Progress = F::Output;
 
     fn poll_progress(
-        state: Pin<&mut Self::Pollable>,
+        state: Pin<&mut F>,
         _: &'a (),
         _: &mut (),
         cx: &mut Context<'_>,
@@ -74,11 +71,17 @@ impl<'a, F: Future> PollWith<'a, (), ()> for PollAsFuture<F> {
     }
 }
 
-impl<'a, S: Stream> PollWith<'a, (), ()> for PollAsStream<S> {
+/// [`PollProxy`] that transforms [`Stream`]s into [`Pollable`] tasks.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PollStream;
+
+impl sealed::Sealed for PollStream {}
+
+impl<'a, S: Stream> PollProxy<'a, S, (), ()> for PollStream {
     type Progress = S::Item;
 
     fn poll_progress(
-        state: Pin<&mut Self::Pollable>,
+        state: Pin<&mut S>,
         _: &'a (),
         _: &mut (),
         cx: &mut Context<'_>,
@@ -88,4 +91,32 @@ impl<'a, S: Stream> PollWith<'a, (), ()> for PollAsStream<S> {
                 .unwrap_or(ControlFlow::Break(None))
         })
     }
+}
+
+/// Noop [`PollProxy`] that only works with [`Pollable`]s.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PollDirect;
+
+impl sealed::Sealed for PollDirect {}
+
+impl<'a, P, E, EMut> PollProxy<'a, P, E, EMut> for PollDirect
+where
+    P: Pollable<'a, E, EMut>,
+    E: ?Sized,
+    EMut: ?Sized,
+{
+    type Progress = P::Progress;
+
+    fn poll_progress(
+        state: Pin<&mut P>,
+        ext: &'a E,
+        ext_mut: &mut EMut,
+        cx: &mut Context<'_>,
+    ) -> Poll<ControlFlow<Option<Self::Progress>, Self::Progress>> {
+        state.poll_progress(ext, ext_mut, cx)
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
 }

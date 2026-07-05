@@ -14,9 +14,8 @@ pub struct Removed<P>(pub(super) list::Removed<Task<P>>);
 
 impl<P> Removed<P> {
     /// Returns the id of this task.
-    pub fn id(&self) -> Id {
-        let node = self.0.node();
-        Id::new(Arc::downgrade(node), node.ready_tx().clone())
+    pub fn id(&self) -> Id<P> {
+        Id(Arc::downgrade(self.0.node()))
     }
 
     /// Returns a pinned reference to the task.

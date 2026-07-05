@@ -106,15 +106,7 @@ impl<T: StoredInList> IntrusiveList<T> {
     }
 
     pub fn insert(&mut self, node: T, data: T::Protected) -> Arc<T> {
-        self.insert_with(node, |_| data)
-    }
-
-    pub fn insert_with<F>(&mut self, node: T, with: F) -> Arc<T>
-    where
-        F: FnOnce(&Arc<T>) -> T::Protected,
-    {
         let new_node = Arc::new(node);
-        let data = with(&new_node);
         unsafe {
             new_node
                 .list_protected()

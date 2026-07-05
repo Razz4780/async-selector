@@ -11,6 +11,7 @@ use async_selector::{
     pollable::{PollStrategy, PollWith},
     selector::Selector,
 };
+use futures::StreamExt;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -29,8 +30,9 @@ async fn main() {
     let mut stop = std::pin::pin!(tokio::time::sleep(Duration::from_secs(5)));
 
     loop {
+        let mut selector_with_ext = selector.with_ext(&(), &mut buffer);
         tokio::select! {
-            Some(result) = selector.next_with_ext(&(), &mut buffer) => match result {
+            Some(result) = selector_with_ext.next() => match result {
                 Ok((addr, data)) if data.is_empty() => {
                     println!("Peer {addr} closed connection");
                 }
@@ -70,7 +72,8 @@ async fn main() {
     selector.wake_all();
 
     while selector
-        .next_with_ext(b"bye bye".as_slice(), &mut ())
+        .with_ext(b"bye bye".as_slice(), &mut ())
+        .next()
         .await
         .transpose()
         .unwrap()

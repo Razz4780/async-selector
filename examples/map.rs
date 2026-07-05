@@ -46,7 +46,7 @@ async fn main() {
 /// This data structure might not be optimal, as the keys are cloned a lot.
 struct StreamMap<K: Clone + Unpin, S: Stream> {
     selector: StreamSelector<NotifyEnd<S, K>>,
-    keys: HashMap<K, Id>,
+    keys: HashMap<K, Id<NotifyEnd<S, K>>>,
 }
 
 impl<K, S> StreamMap<K, S>

@@ -25,9 +25,8 @@ impl<P> Borrowed<'_, P> {
     }
 
     /// Returns the id of this task.
-    pub fn id(&self) -> Id {
-        let node = self.node.node();
-        Id::new(Arc::downgrade(node), node.ready_tx().clone())
+    pub fn id(&self) -> Id<P> {
+        Id(Arc::downgrade(self.node.node()))
     }
 }
 
@@ -55,9 +54,8 @@ impl<P> BorrowedMut<'_, P> {
     }
 
     /// Returns the id of this task.
-    pub fn id(&self) -> Id {
-        let node = self.node.node();
-        Id::new(Arc::downgrade(node), node.ready_tx().clone())
+    pub fn id(&self) -> Id<P> {
+        Id(Arc::downgrade(self.node.node()))
     }
 
     /// Returns a pinned reference to the task.

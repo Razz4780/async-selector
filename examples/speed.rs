@@ -19,6 +19,9 @@ const TASKS: usize = 1024;
 
 /// This example compares speed of [`Selector`](async_selector::selector::Selector)
 /// with [`FuturesUnordered`] and [`SelectAll`].
+///
+/// Each combinator is run in parallel on all threads to showcase
+/// the performance gain coming from no global allocator contestation.
 fn main() {
     let (workers, elapsed) = run_scenario(|| run_in_multi_thread(stream_selector));
     println!(

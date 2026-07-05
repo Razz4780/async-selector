@@ -334,11 +334,9 @@ impl<T: StoredInQueue> Receiver<T> {
         WeakSender(Arc::downgrade(&self.0))
     }
 
-    /// Returns a raw pointer to the queue.
-    ///
-    /// The pointer remains valid as long as any [`Receiver`]/[`Sender`]/[`WeakSender`] for the queue is alive.
-    pub fn as_ptr(&self) -> *const Queue<T> {
-        Arc::as_ptr(&self.0)
+    /// Returns whether the given [`WeakSender`] was created from this [`Receiver`] with [`Self::weak_sender`].
+    pub fn is_parent(&self, weak: &WeakSender<T>) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.0), weak.0.as_ptr())
     }
 }
 
@@ -363,23 +361,6 @@ impl<T: StoredInQueue> WeakSender<T> {
     /// Upgrade fails if there is no live [`Receiver`]/[`Sender`].
     pub fn upgrade(&self) -> Option<Sender<T>> {
         self.0.upgrade().map(Sender)
-    }
-
-    /// Converts this reference into a raw pointer to the queue.
-    pub fn into_raw(self) -> *const Queue<T> {
-        self.0.into_raw()
-    }
-
-    /// Recovers this reference from a raw pointer to the queue.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure that the pointer was obtained with [`Self::into_raw`].
-    pub unsafe fn from_raw(ptr: *const Queue<T>) -> Self {
-        Self(unsafe {
-            // SAFETY: caller ensures that the pointer was obtained from `Self::into_raw`.
-            Weak::from_raw(ptr)
-        })
     }
 }
 

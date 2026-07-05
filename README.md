@@ -40,16 +40,14 @@ let mut selector = StreamSelector::default();
 let txs = (0..10)
     .map(|_| {
         let (tx, rx) = mpsc::channel::<()>(8);
-        let id = selector.push_with_id_cyclic(|id| {
-            rx.map(move |item| (id.clone(), item))
-        });
+        let id = selector.push_with_id(rx);
         (tx, id)
     })
     .collect::<Vec<_>>();
 for (mut tx, saved_id) in txs {
-   tx.send(()).await.unwrap();
-   let (received_id, ()) = selector.next().await.unwrap();
-   assert_eq!(received_id, saved_id);
+    tx.send(()).await.unwrap();
+    let ((), received_id) = selector.with_id().next().await.unwrap();
+    assert_eq!(received_id, saved_id);
 }
 ```
 

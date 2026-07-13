@@ -10,6 +10,7 @@ description = "Fast and flexible asynchronous task selector"
 publish = true
 keywords = ["async", "concurrency"]
 categories = ["asynchronous", "concurrency"]
+rust-version = "1.95.0"
 
 [dependencies]
 futures = "0.3"

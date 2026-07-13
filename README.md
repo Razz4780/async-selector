@@ -4,6 +4,7 @@
 [![Released API docs](https://docs.rs/async-selector/badge.svg)](https://docs.rs/async-selector)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![CI](https://github.com/Razz4780/async-selector/actions/workflows/ci.yaml/badge.svg)](https://github.com/Razz4780/async-selector/actions/workflows/ci.yaml)
+[![MSRV](https://img.shields.io/crates/msrv/async-selector)](https://crates.io/crates/async-selector)
 
 Fast and flexible `Future`/`Stream`/task selector.
 

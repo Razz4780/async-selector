@@ -187,8 +187,10 @@ impl<'a, T: StoredInList> CursorMut<'a, T> {
 /// Reference to a node stored in an [`IntrusiveList`].
 pub struct BorrowedNode<'a, T: StoredInList> {
     pub(super) node: ManuallyDrop<Arc<T>>,
-    /// This allows us to be sure that borrowing rules are not violated.
-    pub(super) _lifetime_guard: PhantomData<&'a ()>,
+    /// This marker ensures:
+    /// 1. borrowing rules are not violated, AND
+    /// 2. the struct has correct [`Send`] and [`Sync`].
+    pub(super) _lifetime_guard: PhantomData<&'a T::Protected>,
 }
 
 impl<T: StoredInList> BorrowedNode<'_, T> {
@@ -210,8 +212,10 @@ impl<T: StoredInList> BorrowedNode<'_, T> {
 /// Mutable reference to a node stored in an [`IntrusiveList`].
 pub struct BorrowedNodeMut<'a, T: StoredInList> {
     pub(super) node: ManuallyDrop<Arc<T>>,
-    /// This allows us to be sure that borrowing rules are not violated.
-    pub(super) _lifetime_guard: PhantomData<&'a ()>,
+    /// This marker ensures that:
+    /// 1. borrowing rules are not violated, AND
+    /// 2. the struct has correct [`Send`] and [`Sync`].
+    pub(super) _lifetime_guard: PhantomData<&'a mut T::Protected>,
 }
 
 impl<T: StoredInList> BorrowedNodeMut<'_, T> {

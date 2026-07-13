@@ -16,4 +16,5 @@ futures = "0.3"
 
 [dev-dependencies]
 rstest = "0.26"
+static_assertions = "1"
 tokio = { version = "1", features = ["full"] }

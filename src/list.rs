@@ -53,10 +53,10 @@ impl<T: StoredInList> Default for ListProtected<T> {
     }
 }
 
-/// SAFETY: [`ListProtected`] is only accessed from the [`IntrusiveList`].
-/// The list uses stricter `impl Send` guard.
+/// SAFETY: [`ListProtected`] is only accessed from [`IntrusiveList`]/[`Removed`]/[`BorrowedNode`]/[`BorrowedNodeMut`].
+/// These types uses stricter `impl Send` guard.
 unsafe impl<T: StoredInList> Send for ListProtected<T> {}
-/// SAFETY: [`ListProtected`] is only accessed from the [`IntrusiveList`].
+/// SAFETY: [`ListProtected`] is only accessed from [`IntrusiveList`]/[`Removed`]/[`BorrowedNode`]/[`BorrowedNodeMut`].
 /// The list uses stricter `impl Sync` guard.
 unsafe impl<T: StoredInList> Sync for ListProtected<T> {}
 
@@ -191,7 +191,7 @@ impl<T: StoredInList> IntrusiveList<T> {
             self.head = next;
         }
 
-        Removed(ManuallyDrop::new(item))
+        Removed(ManuallyDrop::new(item), PhantomData)
     }
 
     /// Returns a reference to the node, if the node is currently stored in the list.
@@ -291,7 +291,11 @@ where
 }
 
 /// Node removed from an [`IntrusiveList`].
-pub struct Removed<T: StoredInList>(ManuallyDrop<Arc<T>>);
+pub struct Removed<T: StoredInList>(
+    ManuallyDrop<Arc<T>>,
+    /// This marker ensures that the struct has correct [`Send`] and [`Sync`].
+    PhantomData<Box<T::Protected>>,
+);
 
 impl<T: StoredInList> Removed<T> {
     pub fn node(&self) -> &Arc<T> {
@@ -496,11 +500,18 @@ mod test_helpers {
 #[cfg(test)]
 mod test {
     use std::{
+        cell::Cell,
         ops::Not,
+        rc::Rc,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+    };
+
+    use crate::list::{
+        ListProtected, Removed, StoredInList,
+        cursor::{BorrowedNode, BorrowedNodeMut},
     };
 
     use super::{
@@ -697,4 +708,32 @@ mod test {
         drop(nodes);
         assert_eq!(node_drops.load(Ordering::SeqCst), 3);
     }
+
+    struct TestStoredInList<T>(ListProtected<Self>);
+
+    unsafe impl<T> StoredInList for TestStoredInList<T> {
+        type Protected = T;
+
+        fn list_protected(&self) -> &ListProtected<Self> {
+            &self.0
+        }
+    }
+
+    static_assertions::assert_impl_all!(IntrusiveList<TestStoredInList<usize>>: Send, Sync);
+    static_assertions::assert_impl_all!(Removed<TestStoredInList<usize>>: Send, Sync);
+    static_assertions::assert_impl_all!(BorrowedNode<'static, TestStoredInList<usize>>: Send, Sync);
+    static_assertions::assert_impl_all!(BorrowedNodeMut<'static, TestStoredInList<usize>>: Send, Sync);
+
+    static_assertions::assert_impl_all!(IntrusiveList<TestStoredInList<Cell<usize>>>: Send);
+    static_assertions::assert_not_impl_any!(IntrusiveList<TestStoredInList<Cell<usize>>>: Sync);
+    static_assertions::assert_impl_all!(Removed<TestStoredInList<Cell<usize>>>: Send);
+    static_assertions::assert_not_impl_any!(Removed<TestStoredInList<Cell<usize>>>: Sync);
+    static_assertions::assert_not_impl_any!(BorrowedNode<'static, TestStoredInList<Cell<usize>>>: Send, Sync);
+    static_assertions::assert_impl_all!(BorrowedNodeMut<'static, TestStoredInList<Cell<usize>>>: Send);
+    static_assertions::assert_not_impl_any!(BorrowedNodeMut<'static, TestStoredInList<Cell<usize>>>: Sync);
+
+    static_assertions::assert_not_impl_any!(IntrusiveList<TestStoredInList<Rc<usize>>>: Send, Sync);
+    static_assertions::assert_not_impl_any!(Removed<TestStoredInList<Rc<usize>>>: Send, Sync);
+    static_assertions::assert_not_impl_any!(BorrowedNode<'static, TestStoredInList<Rc<usize>>>: Send, Sync);
+    static_assertions::assert_not_impl_any!(BorrowedNodeMut<'static, TestStoredInList<Rc<usize>>>: Send, Sync);
 }

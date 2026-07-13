@@ -76,12 +76,12 @@ impl<T: StoredInQueue> Queue<T> {
         if node.queue_link().in_queue.swap(true, Ordering::AcqRel) {
             return;
         }
-        unsafe {
-            // SAFETY: the swap above acts as a mutex.
-            // Only one enqueueing thread can reach this line.
-            // Dequeueing thread releases the mutex as the last step.
-            *node.queue_link().next.as_ptr().as_mut_unchecked() = std::ptr::null_mut();
-        }
+        // The swap above acts as a mutex.
+        // Only one enqueueing thread can reach this line.
+        // Relaxed ordering is fine here.
+        node.queue_link()
+            .next
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
         let node = Arc::into_raw(node);
 
         unsafe {
@@ -176,11 +176,10 @@ impl<T: StoredInQueue> Queue<T> {
         }
 
         // Enqueue the stub.
-        unsafe {
-            // SAFETY: the queue has a stable non-stub node, so no enqueueing thread uses the stub.
-            // Caller guarantees no concurrent calls to this method.
-            *self.stub.queue_link().next.as_ptr().as_mut_unchecked() = std::ptr::null_mut();
-        }
+        self.stub
+            .queue_link()
+            .next
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
         let stub = std::ptr::from_ref(&self.stub).cast_mut();
         let stub_predecessor = self.head.swap(stub, Ordering::AcqRel);
         unsafe {

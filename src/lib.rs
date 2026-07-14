@@ -73,6 +73,7 @@ mod task;
 ///
 /// Behaves much like [`FuturesUnordered`](futures::stream::FuturesUnordered).
 pub type FutureSelector<F> = Selector<F, PollFuture>;
+
 /// [`Selector`] specialized for polling [`Stream`](futures::stream::Stream)s.
 ///
 /// Behaves much like [`SelectAll`](futures::stream::SelectAll).

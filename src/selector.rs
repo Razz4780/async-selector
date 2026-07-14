@@ -9,7 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 
 use crate::{
     list::{
@@ -17,7 +17,7 @@ use crate::{
         cursor::{Cursor, CursorMut},
     },
     mpsc,
-    pollable::{PollDirect, PollProxy},
+    pollable::{PollDirect, PollProxy, Pollable},
     selector::{
         ext::{WithExt, WithExtAndId, WithId},
         iter::{ExtractIf, IntoIter, Iter, IterMut},
@@ -389,6 +389,27 @@ where
     }
 }
 
+impl<'a, T, P, E, EMut> Pollable<'a, E, EMut> for Selector<T, P>
+where
+    P: PollProxy<'a, T, E, EMut>,
+    E: ?Sized,
+    EMut: ?Sized,
+{
+    type Progress = P::Progress;
+
+    fn poll_progress(
+        self: Pin<&mut Self>,
+        ext: &'a E,
+        ext_mut: &mut EMut,
+        cx: &mut Context<'_>,
+    ) -> Poll<ControlFlow<Option<Self::Progress>, Self::Progress>> {
+        self.get_mut()
+            .with_ext(ext, ext_mut)
+            .poll_next_unpin(cx)
+            .map(|opt| opt.map_or(ControlFlow::Break(None), ControlFlow::Continue))
+    }
+}
+
 impl<T, P> Default for Selector<T, P> {
     fn default() -> Self {
         Self {
@@ -415,7 +436,7 @@ impl<T, P> Extend<T> for Selector<T, P> {
     }
 }
 
-impl<T, S> FromIterator<T> for Selector<T, S> {
+impl<T, P> FromIterator<T> for Selector<T, P> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut this = Self::default();
         this.extend(iter);
@@ -423,7 +444,7 @@ impl<T, S> FromIterator<T> for Selector<T, S> {
     }
 }
 
-impl<T, S> IntoIterator for Selector<T, S> {
+impl<T, P> IntoIterator for Selector<T, P> {
     type IntoIter = IntoIter<T>;
     type Item = Removed<T>;
 

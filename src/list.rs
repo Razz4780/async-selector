@@ -56,6 +56,7 @@ impl<T: StoredInList> Default for ListProtected<T> {
 /// SAFETY: [`ListProtected`] is only accessed from [`IntrusiveList`]/[`Removed`]/[`BorrowedNode`]/[`BorrowedNodeMut`].
 /// These types uses stricter `impl Send` guard.
 unsafe impl<T: StoredInList> Send for ListProtected<T> {}
+
 /// SAFETY: [`ListProtected`] is only accessed from [`IntrusiveList`]/[`Removed`]/[`BorrowedNode`]/[`BorrowedNodeMut`].
 /// The list uses stricter `impl Sync` guard.
 unsafe impl<T: StoredInList> Sync for ListProtected<T> {}

@@ -10,12 +10,11 @@ description = "Fast and flexible asynchronous task selector"
 publish = true
 keywords = ["async", "concurrency"]
 categories = ["asynchronous", "concurrency"]
-rust-version = "1.95.0"
+rust-version = "1.85.1"
 
 [dependencies]
 futures = "0.3"
+static_assertions = "1"
 
 [dev-dependencies]
-rstest = "0.26"
-static_assertions = "1"
 tokio = { version = "1", features = ["full"] }

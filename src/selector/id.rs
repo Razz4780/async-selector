@@ -1,58 +1,62 @@
 use std::{
-    cmp::Ordering,
-    fmt,
-    hash::{Hash, Hasher},
-    sync::Weak,
+    fmt, hash,
+    sync::{Arc, Weak},
 };
 
-use crate::task::Task;
+use crate::list::Node;
 
-/// A unique id of a task stored in a [`Selector`](crate::selector::Selector).
+/// Unique ID of a task pushed into a [`Selector`](crate::selector::Selector).
 ///
-/// See [example](https://github.com/Razz4780/async-selector/blob/main/examples/map.rs)
-/// of how it can be leverage to use the selector like a map.
-///
-/// Mind that this keeping this id alive prevents the selector
-/// from deallocating memory used to store the task.
-pub struct Id<P>(pub(super) Weak<Task<P>>);
+/// This ID is always unique relative to all other IDs,
+/// including IDs obtained from other selectors.
+#[repr(transparent)]
+pub struct Id<C>(Arc<Node<C>>);
 
-impl<P> Clone for Id<P> {
+impl<C> Id<C> {
+    pub(super) fn new(node: &Arc<Node<C>>) -> &Self {
+        let ptr = std::ptr::from_ref(node) as *const Self;
+        unsafe { &*ptr }
+    }
+
+    pub(super) fn get(&self) -> &Arc<Node<C>> {
+        &self.0
+    }
+
+    /// Manually wakes this task.
+    ///
+    /// Does nothing if the task is no longer stored in the selector.
+    pub fn wake(&self) {
+        self.0.enqueue_by_ref();
+    }
+}
+
+impl<C> Clone for Id<C> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<P> fmt::Debug for Id<P> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Weak::as_ptr(&self.0).fmt(f)
-    }
-}
-
-impl<P> PartialEq for Id<P> {
+impl<C> PartialEq for Id<C> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.ptr_eq(&other.0)
+        let this = Arc::as_ptr(&self.0);
+        let other = Arc::as_ptr(&other.0);
+        this.eq(&other)
     }
 }
 
-impl<P> Eq for Id<P> {}
+impl<C> Eq for Id<C> {}
 
-impl<P> Hash for Id<P> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        std::ptr::hash(self.0.as_ptr(), state);
+impl<C> hash::Hash for Id<C> {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
     }
 }
 
-impl<P> PartialOrd for Id<P> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+impl<C> fmt::Debug for Id<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Id")
+            .field("task_ptr", &Arc::as_ptr(&self.0))
+            .field("queue_ptr", &Weak::as_ptr(self.0.queue()))
+            .finish()
     }
 }
-
-impl<P> Ord for Id<P> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.as_ptr().cmp(&other.0.as_ptr())
-    }
-}
-
-unsafe impl<P> Send for Id<P> {}
-unsafe impl<P> Sync for Id<P> {}

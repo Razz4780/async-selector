@@ -1,111 +1,18 @@
-//! Types for iterating over tasks stored in a [`Selector`](crate::selector::Selector).
-
-use std::pin::Pin;
+//! [`Selector`](super::Selector) visitors.
 
 use crate::{
-    list::{
-        IntrusiveList,
-        cursor::{Cursor, CursorMut},
-    },
-    mpsc,
-    selector::{
-        Removed,
-        borrowed::{Borrowed, BorrowedMut},
-    },
-    task::Task,
+    list::{Cursor, List},
+    selector::{Borrowed, BorrowedMut, Removed},
 };
 
-/// Iterator that visits tasks stored in a [`Selector`](crate::selector::Selector).
-///
-/// Tasks are visited in the insertion order.
-pub struct Iter<'a, P> {
-    pub(super) cursor: Cursor<'a, Task<P>>,
-    pub(super) queue: &'a mpsc::Receiver<Task<P>>,
-}
+/// Returned from [`Selector::into_iter`](super::Selector::into_iter).
+pub struct IntoIter<T>(pub(super) List<T>);
 
-impl<'a, P> Iterator for Iter<'a, P> {
-    type Item = Borrowed<'a, P>;
+impl<T> Iterator for IntoIter<T> {
+    type Item = Removed<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Some(Borrowed {
-            node: self.cursor.pop_front()?,
-            queue: self.queue,
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.cursor.len();
-        (len, Some(len))
-    }
-}
-
-impl<P> ExactSizeIterator for Iter<'_, P> {
-    fn len(&self) -> usize {
-        self.cursor.len()
-    }
-}
-
-impl<P> DoubleEndedIterator for Iter<'_, P> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        Some(Borrowed {
-            node: self.cursor.pop_back()?,
-            queue: self.queue,
-        })
-    }
-}
-
-/// Iterator that allows for modifying tasks stored in a [`Selector`](crate::selector::Selector).
-///
-/// Tasks are visited in the insertion order.
-///
-/// **Important:** before modifying tasks stored in the selector, see the wakeups [section](crate::selector::Selector#wakeups).
-pub struct IterMut<'a, P> {
-    pub(super) cursor: CursorMut<'a, Task<P>>,
-    pub(super) queue: &'a mpsc::Receiver<Task<P>>,
-}
-
-impl<'a, P> Iterator for IterMut<'a, P> {
-    type Item = BorrowedMut<'a, P>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Some(BorrowedMut {
-            node: self.cursor.pop_front()?,
-            queue: self.queue,
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.cursor.len();
-        (len, Some(len))
-    }
-}
-
-impl<P> ExactSizeIterator for IterMut<'_, P> {
-    fn len(&self) -> usize {
-        self.cursor.len()
-    }
-}
-
-impl<P> DoubleEndedIterator for IterMut<'_, P> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        Some(BorrowedMut {
-            node: self.cursor.pop_back()?,
-            queue: self.queue,
-        })
-    }
-}
-
-/// Iterator that returns tasks stored previously in a [`Selector`](crate::selector::Selector).
-///
-/// If the iterator is not exhausted, e.g. because it is dropped without iterating or the iteration short-circuits,
-/// then the remaining tasks are dropped.
-pub struct IntoIter<P>(pub(super) IntrusiveList<Task<P>>);
-
-impl<P> Iterator for IntoIter<P> {
-    type Item = Removed<P>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        CursorMut::new(&mut self.0).remove_front().map(Removed)
+        self.0.cursor_mut().remove_front().map(Removed)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -114,45 +21,91 @@ impl<P> Iterator for IntoIter<P> {
     }
 }
 
-impl<P> ExactSizeIterator for IntoIter<P> {
+impl<T> ExactSizeIterator for IntoIter<T> {
     fn len(&self) -> usize {
         self.0.len()
     }
 }
 
-impl<P> DoubleEndedIterator for IntoIter<P> {
+impl<T> DoubleEndedIterator for IntoIter<T> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        CursorMut::new(&mut self.0).remove_back().map(Removed)
+        self.0.cursor_mut().remove_back().map(Removed)
     }
 }
 
-/// Iterator which uses a closure to determine if a task should be removed from a [`Selector`](crate::selector::Selector).
-///
-/// If the closure returns true, the task is removed from the selector and yielded.
-///
-/// If the iterator is not exhausted, e.g. because it is dropped without iterating or the iteration short-circuits,
-/// then the remaining tasks will be retained.
-///
-/// **Important:** before removing tasks from the selector, see the removal [section](crate::selector::Selector#removal).
-pub struct ExtractIf<'a, P, F>
-where
-    F: FnMut(Pin<&mut P>) -> bool,
-{
-    pub(super) cursor: CursorMut<'a, Task<P>>,
+/// Returned from [`Selector::iter`](super::Selector::iter).
+pub struct Iter<'a, T>(pub(super) Cursor<T, &'a List<T>>);
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = Borrowed<'a, T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.pop_front().map(Borrowed)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<T> ExactSizeIterator for Iter<'_, T> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<T> DoubleEndedIterator for Iter<'_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.pop_back().map(Borrowed)
+    }
+}
+
+/// Returned from [`Selector::iter_mut`](super::Selector::iter_mut).
+pub struct IterMut<'a, T>(pub(super) Cursor<T, &'a mut List<T>>);
+
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = BorrowedMut<'a, T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.pop_front().map(BorrowedMut)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<T> ExactSizeIterator for IterMut<'_, T> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<T> DoubleEndedIterator for IterMut<'_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.pop_back().map(BorrowedMut)
+    }
+}
+
+/// Returned from [`Selector::extract_if`](super::Selector::extract_if).
+pub struct ExtractIf<'a, T, F> {
+    pub(super) cursor: Cursor<T, &'a mut List<T>>,
     pub(super) pred: F,
 }
 
-impl<'a, P, F> Iterator for ExtractIf<'a, P, F>
+impl<'a, T, F> Iterator for ExtractIf<'a, T, F>
 where
-    F: FnMut(Pin<&mut P>) -> bool,
+    F: for<'b> FnMut(BorrowedMut<'b, T>) -> bool,
 {
-    type Item = Removed<P>;
+    type Item = Removed<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let mut front = self.cursor.peek_front()?;
-            if (self.pred)(front.get_protected_mut()) {
-                return self.cursor.remove_front().map(Removed);
+            let next = self.cursor.peek_front()?;
+            if (self.pred)(BorrowedMut(next)) {
+                break self.cursor.remove_front().map(Removed);
             } else {
                 self.cursor.pop_front();
             }
@@ -160,20 +113,19 @@ where
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.cursor.len();
-        (0, Some(len))
+        (0, None)
     }
 }
 
-impl<'a, P, F> DoubleEndedIterator for ExtractIf<'a, P, F>
+impl<'a, T, F> DoubleEndedIterator for ExtractIf<'a, T, F>
 where
-    F: FnMut(Pin<&mut P>) -> bool,
+    F: for<'b> FnMut(BorrowedMut<'b, T>) -> bool,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
-            let mut back = self.cursor.peek_back()?;
-            if (self.pred)(back.get_protected_mut()) {
-                return self.cursor.remove_back().map(Removed);
+            let back = self.cursor.peek_back()?;
+            if (self.pred)(BorrowedMut(back)) {
+                break self.cursor.remove_back().map(Removed);
             } else {
                 self.cursor.pop_back();
             }

@@ -16,6 +16,7 @@ use tokio::{sync::Barrier, task::JoinSet};
 
 const ITEMS_IN_TASK: usize = 16 * 1024;
 const TASKS: usize = 1024;
+const EXPECTED_SUM: usize = 137430564864;
 
 /// This example compares speed of [`Selector`](async_selector::selector::Selector)
 /// with [`FuturesUnordered`] and [`SelectAll`].
@@ -91,9 +92,9 @@ async fn stream_selector() -> Duration {
         selector.push(MyStream::default().take(ITEMS_IN_TASK));
     }
     let start = Instant::now();
-    let count = selector.collect::<Count>().await;
+    let sum = selector.collect::<Sum>().await;
     let elapsed = start.elapsed();
-    assert_eq!(count.0, TASKS * ITEMS_IN_TASK);
+    assert_eq!(sum.0, EXPECTED_SUM);
     elapsed
 }
 
@@ -103,33 +104,33 @@ async fn select_all() -> Duration {
         selector.push(MyStream::default().take(ITEMS_IN_TASK));
     }
     let start = Instant::now();
-    let count = selector.collect::<Count>().await;
+    let sum = selector.collect::<Sum>().await;
     let elapsed = start.elapsed();
-    assert_eq!(count.0, TASKS * ITEMS_IN_TASK);
+    assert_eq!(sum.0, EXPECTED_SUM);
     elapsed
 }
 
 async fn future_selector() -> Duration {
     let mut selector = FutureSelector::default();
     for _ in 0_usize..TASKS {
-        selector.push(MyStream::default().take(ITEMS_IN_TASK).collect::<Count>());
+        selector.push(MyStream::default().take(ITEMS_IN_TASK).collect::<Sum>());
     }
     let start = Instant::now();
-    let count = selector.collect::<Count>().await;
+    let sum = selector.collect::<Sum>().await;
     let elapsed = start.elapsed();
-    assert_eq!(count.0, TASKS * ITEMS_IN_TASK);
+    assert_eq!(sum.0, EXPECTED_SUM);
     elapsed
 }
 
 async fn futures_unordered() -> Duration {
     let selector = FuturesUnordered::default();
     for _ in 0_usize..TASKS {
-        selector.push(MyStream::default().take(ITEMS_IN_TASK).collect::<Count>());
+        selector.push(MyStream::default().take(ITEMS_IN_TASK).collect::<Sum>());
     }
     let start = Instant::now();
-    let count = selector.collect::<Count>().await;
+    let sum = selector.collect::<Sum>().await;
     let elapsed = start.elapsed();
-    assert_eq!(count.0, TASKS * ITEMS_IN_TASK);
+    assert_eq!(sum.0, EXPECTED_SUM);
     elapsed
 }
 
@@ -144,10 +145,10 @@ fn run_scenario<T, F: Fn() -> T>(scenario: F) -> T {
 }
 
 #[derive(Default, Debug)]
-struct MyStream(bool);
+struct MyStream(bool, usize);
 
 impl Stream for MyStream {
-    type Item = ();
+    type Item = usize;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -156,24 +157,26 @@ impl Stream for MyStream {
             cx.waker().wake_by_ref();
             Poll::Pending
         } else {
-            Poll::Ready(Some(()))
+            let item = this.1;
+            this.1 += 1;
+            Poll::Ready(Some(item))
         }
     }
 }
 
 #[derive(Default)]
-struct Count(usize);
+struct Sum(usize);
 
-impl Extend<()> for Count {
-    fn extend<T: IntoIterator<Item = ()>>(&mut self, iter: T) {
-        for _ in iter {
-            self.0 += 1;
+impl Extend<usize> for Sum {
+    fn extend<T: IntoIterator<Item = usize>>(&mut self, iter: T) {
+        for i in iter {
+            self.0 += i;
         }
     }
 }
 
-impl Extend<Count> for Count {
-    fn extend<T: IntoIterator<Item = Count>>(&mut self, iter: T) {
+impl Extend<Sum> for Sum {
+    fn extend<T: IntoIterator<Item = Sum>>(&mut self, iter: T) {
         for i in iter {
             self.0 += i.0;
         }

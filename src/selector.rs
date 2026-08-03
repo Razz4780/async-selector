@@ -1,52 +1,40 @@
-//! Fast and flexible [`Future`]/[`Stream`] selector.
+mod id;
+pub mod iter;
+mod waker;
+mod wrappers;
 
 use std::{
+    cell::Cell,
     fmt,
-    marker::PhantomData,
-    ops::{ControlFlow, Not},
+    ops::{ControlFlow, Index, IndexMut, Not},
     pin::Pin,
-    sync::Arc,
+    rc::Rc,
+    sync::{Arc, Weak},
     task::{Context, Poll},
 };
 
-use futures::{Stream, StreamExt};
+use futures::Stream;
 
 use crate::{
-    list::{
-        IntrusiveList,
-        cursor::{Cursor, CursorMut},
-    },
-    mpsc,
-    pollable::{PollDirect, PollProxy, Pollable},
-    selector::{
-        ext::{WithExt, WithExtAndId, WithId},
-        iter::{ExtractIf, IntoIter, Iter, IterMut},
-    },
+    list::{self, List, Node},
+    queue::Receiver,
+    selector::{iter::ExtractIf, waker::NodeWaker},
     task::Task,
 };
 
-pub use borrowed::{Borrowed, BorrowedMut};
-pub use id::Id;
-pub use removed::Removed;
+pub use crate::selector::{
+    id::Id,
+    wrappers::{Borrowed, BorrowedMut, Removed},
+};
 
-mod borrowed;
-pub mod ext;
-mod id;
-pub mod iter;
-mod removed;
-
-/// Selector over a dynamic set of pollable tasks, for example [`Future`]s and [`Stream`]s.
+/// Selector over a dynamic set of [`Task`]s (generalized [`Future`]s/[`Stream`]s).
 ///
-/// Designed for optimal performance when polling a large number of tasks
-/// (see [example](https://github.com/Razz4780/async-selector/blob/main/examples/speed.rs)).
-///
-/// Allows for:
-/// 1. Safely injecting shared state into the tasks (see [`Pollable`](crate::pollable::Pollable)).
-/// 2. Accessing and removing the tasks by unique ids.
+/// Inspired by [`FuturesUnordered`](futures::stream::FuturesUnordered),
+/// designed for flexibility and optimal performance when polling a large number of tasks.
 ///
 /// Unless you want to exercise the full flexibility of this type,
-/// you can use the specialized [`FutureSelector`](crate::FutureSelector)
-/// and [`StreamSelector`](crate::StreamSelector).
+/// you can stick to the specializations exposed in the root of this crate
+/// (e.g. [`FutureSelector`](crate::FutureSelector) and [`StreamSelector`](crate::StreamSelector)).
 ///
 /// # Removal
 ///
@@ -54,12 +42,11 @@ mod removed;
 /// Removing a task from the selector does not instantly free that memory.
 /// The memory can only be freed when:
 /// 1. all [`Id`] instances for this task are dropped, AND
-/// 2. [`Removed`] instance is dropped or consumed, AND
+/// 2. [`Removed`] instance is dropped, AND
 /// 3. the [`Waker`](std::task::Waker) (and all its clones)
-///    passed when polling the task are dropped or consumed, AND
-/// 4. the selector observes the task removal.
-///
-/// The selector always eventually observes the removal when polled.
+///    passed when polling the task is dropped, AND
+/// 4. the selector observes the task removal
+///    (which happens when the selector is polled).
 ///
 /// # Wakeups
 ///
@@ -67,47 +54,53 @@ mod removed;
 /// A task is **only** polled in the following cases:
 /// 1. after it is pushed into the selector
 /// 2. after it yields a non-terminal value
-/// 3. after the waker passed to [`PollProxy::poll_progress`] inside [`Context`] is woken
+/// 3. after the waker passed to [`Task::poll_progress`] receives a wakeup
 ///
 /// To avoid nasty surprises, keep this in mind when:
 /// 1. Modifying a task borrowed from the selector
-/// 2. Polling the selector with different extension types
+/// 2. Changing the strategy used by the selector
+///    (see [example](https://github.com/Razz4780/async-selector/blob/main/examples/custom.rs))
 ///
-/// See [example](https://github.com/Razz4780/async-selector/blob/main/examples/extensions.rs).
+/// The wakeups are stored in a FIFO queue. This implies that the selector
+/// processes ready tasks in a round-robin fashion.
 ///
 /// # Panic
 ///
-/// If the task panics when polled, the task is removed from the selector and dropped.
-/// The selector remains valid.
-pub struct Selector<T, P = PollDirect> {
-    /// Queue of tasks that were woken.
-    ready_rx: mpsc::Receiver<Task<T>>,
+/// If the [`Task`] implementation panics, the task is removed from the selector and dropped,
+/// and the panic propagates. The selector remains valid.
+pub struct Selector<T, S> {
+    /// Queue of tasks that received a wakeup.
+    queue: Receiver<list::ListProtected<T>>,
     /// List of all tasks.
-    list: IntrusiveList<Task<T>>,
-    _proxy: PhantomData<fn() -> P>,
+    list: List<T>,
+    /// Strategy that determines how the selector polls the tasks.
+    strategy: S,
 }
 
-impl<T, P> Selector<T, P> {
-    /// Pushes a new task into the selector.
-    ///
-    /// This method is O(1).
-    pub fn push(&mut self, task: T) {
-        let task = self
-            .list
-            .insert(Task::empty(self.ready_rx.weak_sender()), task);
-        self.ready_rx.send(task);
+impl<T, S> Selector<T, S> {
+    /// Creates an empty selector with the given strategy.
+    pub fn new(strategy: S) -> Self {
+        Self {
+            queue: Default::default(),
+            list: Default::default(),
+            strategy,
+        }
     }
 
-    /// Pushes a new task into the selector and returns its unique id.
+    /// Pushes the given task into the selector, returning a mutable reference to the task.
+    ///
+    /// The reference can be used to obtain the task's [`Id`].
     ///
     /// This method is O(1).
-    pub fn push_with_id(&mut self, task: T) -> Id<T> {
-        let task = self
-            .list
-            .insert(Task::empty(self.ready_rx.weak_sender()), task);
-        let id = Id(Arc::downgrade(&task));
-        self.ready_rx.send(task);
-        id
+    pub fn push(&mut self, task: T) -> BorrowedMut<'_, T> {
+        BorrowedMut(self.list.push_back(self.queue.queue(), task))
+    }
+
+    /// Returns the number of tasks stored in the selector.
+    ///
+    /// This method is O(1).
+    pub fn len(&self) -> usize {
+        self.list.len()
     }
 
     /// Returns whether the selector is empty.
@@ -117,326 +110,129 @@ impl<T, P> Selector<T, P> {
         self.list.is_empty()
     }
 
-    /// Returns the number of tasks in the selector.
+    /// Returns whether the selector contains a task with the given [`Id`].
     ///
     /// This method is O(1).
-    pub fn len(&self) -> usize {
-        self.list.len()
+    pub fn contains(&self, id: &Id<T>) -> bool {
+        self.get(id).is_some()
     }
 
-    /// Manually wakes all tasks in the selector.
+    /// If the selector contains a task with the given [`Id`], returns a reference to it.
     ///
-    /// Depending on the [`PollProxy::poll_progress`] implementation,
-    /// this might be required when polling with different extension types.
-    /// See the wakeups [section](Selector#wakeups).
-    ///
-    /// This method is O(n).
-    pub fn wake_all(&self) {
-        self.iter().for_each(|borrowed| borrowed.wake());
+    /// This method is O(1).
+    pub fn get<'a>(&'a self, id: &Id<T>) -> Option<Borrowed<'a, T>> {
+        if self.created(id.get()).not() {
+            return None;
+        }
+        unsafe { self.list.get(id.get()).map(Borrowed) }
     }
 
-    /// Returns an iterator over the tasks in the selector.
+    /// If the selector contains a task with the given [`Id`], returns a mutable reference to it.
     ///
-    /// The tasks are visited in the insertion order.
-    pub fn iter(&self) -> Iter<'_, T> {
-        Iter {
-            cursor: Cursor::new(&self.list),
-            queue: &self.ready_rx,
+    /// This method is O(1).
+    pub fn get_mut<'a>(&'a mut self, id: &Id<T>) -> Option<BorrowedMut<'a, T>> {
+        if self.created(id.get()).not() {
+            return None;
+        }
+        unsafe { self.list.get_mut(id.get()).map(BorrowedMut) }
+    }
+
+    /// If the selector contains a task with the given [`Id`], removes it.
+    ///
+    /// This method is O(1).
+    pub fn remove(&mut self, id: &Id<T>) -> Option<Removed<T>> {
+        if self.created(id.get()).not() {
+            return None;
+        }
+        unsafe { self.list.remove(id.get()).map(Removed) }
+    }
+
+    /// Returns a reference to the strategy used by this selector.
+    pub fn strategy(&self) -> &S {
+        &self.strategy
+    }
+
+    /// Returns a mutable reference to the strategy used by this selector.
+    pub fn strategy_mut(&mut self) -> &mut S {
+        &mut self.strategy
+    }
+
+    /// Returns a new selector with the same state, but different strategy.
+    pub fn with_strategy<S1>(self, strategy: S1) -> Selector<T, S1> {
+        Selector {
+            queue: self.queue,
+            list: self.list,
+            strategy,
         }
     }
 
-    /// Returns an iterator that allows modifying each task in the selector.
+    /// Returns an iterator over all tasks in the selector.
     ///
     /// The tasks are visited in the insertion order.
+    pub fn iter(&self) -> iter::Iter<'_, T> {
+        iter::Iter(self.list.cursor())
+    }
+
+    /// Returns an iterator that allows for modifying each task in the selector.
     ///
-    /// **Important:** before modifying tasks stored in the selector, see the wakeups [section](Selector#wakeups).
-    pub fn iter_mut(&mut self) -> IterMut<'_, T> {
-        IterMut {
-            cursor: CursorMut::new(&mut self.list),
-            queue: &self.ready_rx,
-        }
+    /// The tasks are visited in the insertion order.
+    pub fn iter_mut(&mut self) -> iter::IterMut<'_, T> {
+        iter::IterMut(self.list.cursor_mut())
     }
 
     /// Creates an iterator which uses a closure to determine if a task should be removed.
     ///
     /// If the closure returns true, the task is removed from the selector and yielded.
+    /// The tasks are visited in the insertion order.
     ///
     /// If the returned [`ExtractIf`] is not exhausted, e.g. because it is dropped without iterating or the iteration short-circuits,
     /// then the remaining tasks will be retained.
-    ///
-    /// **Important:** before removing tasks from the selector, see the removal [section](Selector#removal).
     #[must_use = "ExtractIf does not remove any elements unless consumed"]
     pub fn extract_if<F>(&mut self, pred: F) -> ExtractIf<'_, T, F>
     where
-        F: FnMut(Pin<&mut T>) -> bool,
+        F: for<'b> FnMut(BorrowedMut<'b, T>) -> bool,
     {
         ExtractIf {
-            cursor: CursorMut::new(&mut self.list),
+            cursor: self.list.cursor_mut(),
             pred,
         }
     }
 
-    /// Returns an immutable reference to the task with the given id.
+    /// Retains only the tasks specified by the predicate.
     ///
-    /// Returns `None` if the task is not found in this selector,
-    /// for example because it was removed or has already finished.
-    ///
-    /// This method is O(1).
-    pub fn get(&self, id: &Id<T>) -> Option<Borrowed<'_, T>> {
-        let task = id.0.upgrade()?;
-        if self.ready_rx.is_parent(task.ready_tx()).not() {
-            return None;
-        }
-        let node = unsafe {
-            // SAFETY: we just checked that this id comes from this selector.
-            // Therefore, the task cannot be stored in any other list.
-            self.list.get(&task)
-        }?;
-        Some(Borrowed {
-            node,
-            queue: &self.ready_rx,
-        })
-    }
-
-    /// Returns a mutable reference to the target with the given id.
-    ///
-    /// Returns `None` if the task is not found in this selector,
-    /// for example because it was removed or has already finished.
-    ///
-    /// This method is O(1).
-    ///
-    /// **Important:** before modifying tasks stored in the selector, see the wakeups [section](Selector#wakeups).
-    pub fn get_mut(&mut self, id: &Id<T>) -> Option<BorrowedMut<'_, T>> {
-        let task = id.0.upgrade()?;
-        if self.ready_rx.is_parent(task.ready_tx()).not() {
-            return None;
-        }
-        let node = unsafe {
-            // SAFETY: we just checked that this id comes from this selector.
-            // Therefore, the task cannot be stored in any other list.
-            self.list.get_mut(&task)
-        }?;
-        Some(BorrowedMut {
-            node,
-            queue: &self.ready_rx,
-        })
-    }
-
-    /// Removes the task with the given id from the selector.
-    ///
-    /// Returns `None` if the task is not found in the selector,
-    /// for example because it was removed or has already finished.
-    ///
-    /// This method is O(1).
-    ///
-    /// **Important:** before removing tasks from the selector, see the removal [section](Selector#removal).
-    pub fn remove(&mut self, id: &Id<T>) -> Option<Removed<T>> {
-        let task = id.0.upgrade()?;
-        if self.ready_rx.is_parent(task.ready_tx()).not() {
-            return None;
-        }
-        let removed = unsafe {
-            // SAFETY: we just checked that this id comes from this selector.
-            // Therefore, the task cannot be stored in any other list.
-            self.list.remove(&task)?
-        };
-        Some(Removed(removed))
-    }
-
-    /// Borrows a [`Stream`] that will pass the given extensions to the tasks when polling.
-    ///
-    /// **Important:** before polling the tasks with different extension types, see the wakeups [section](Selector#wakeups).
-    pub fn with_ext<'s, 'e, 'emut, E, EMut>(
-        &'s mut self,
-        ext: &'e E,
-        ext_mut: &'emut mut EMut,
-    ) -> WithExt<'s, 'e, 'emut, T, P, E, EMut>
+    /// In other words, remove all tasks for which the predicate returns false.
+    /// The tasks are visited in the insertion order.
+    pub fn retain<F>(&mut self, mut pred: F)
     where
-        P: PollProxy<'e, T, E, EMut>,
-        E: ?Sized,
-        EMut: ?Sized,
+        F: for<'b> FnMut(BorrowedMut<'b, T>) -> bool,
     {
-        WithExt {
-            selector: self,
-            ext,
-            ext_mut,
-        }
+        for _ in self.extract_if(|borrowed| pred(borrowed).not()) {}
     }
 
-    /// Borrows a [`Stream`] that will return a task [`Id`] with every item.
-    pub fn with_id(&mut self) -> WithId<'_, T, P>
-    where
-        P: PollProxy<'static, T, (), ()>,
-    {
-        WithId { selector: self }
+    /// Manually wakes all tasks in the selector.
+    pub fn wake_all(&self) {
+        self.iter().for_each(|task| task.id().wake());
     }
 
-    /// Borrows a [`Stream`] that will pass the given extensions to the tasks when polling,
-    /// and return a task [`Id`] with every item.
-    ///
-    /// **Important:** before polling the tasks with different extension types, see the wakeups [section](Selector#wakeups).
-    pub fn with_ext_and_id<'s, 'e, 'emut, E, EMut>(
-        &'s mut self,
-        ext: &'e E,
-        ext_mut: &'emut mut EMut,
-    ) -> WithExtAndId<'s, 'e, 'emut, T, P, E, EMut>
-    where
-        P: PollProxy<'e, T, E, EMut>,
-        E: ?Sized,
-        EMut: ?Sized,
-    {
-        WithExtAndId {
-            selector: self,
-            ext,
-            ext_mut,
-        }
-    }
-
-    /// Returns the next ready item from one of the tasks stored in the selector.
-    ///
-    /// Provided extensions will be passed down to the tasks as arguments to [`PollWith::poll_progress`].
-    /// Provided `extra` lambda can be used to extract additional data from the [`Task`] instance.
-    ///
-    /// Returns `None` if the selector is empty.
-    #[allow(clippy::type_complexity)]
-    fn poll_next_inner<'a, E, EMut, F, I>(
-        &mut self,
-        ext: &'a E,
-        ext_mut: &mut EMut,
-        extra: F,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<(P::Progress, I)>>
-    where
-        P: PollProxy<'a, T, E, EMut>,
-        E: ?Sized,
-        EMut: ?Sized,
-        F: FnOnce(&Arc<Task<T>>) -> I,
-    {
-        let marker = self.ready_rx.register(cx.waker());
-        if marker.is_null() {
-            return if self.list.is_empty() {
-                Poll::Ready(None)
-            } else {
-                Poll::Pending
-            };
-        }
-
-        let mut polled_all_queue = false;
-        while polled_all_queue.not() {
-            let task = match self.ready_rx.recv() {
-                Some(task) => {
-                    polled_all_queue = std::ptr::eq(task.as_ref(), marker);
-                    task
-                }
-                None if self.list.is_empty() => return Poll::Ready(None),
-                None => return Poll::Pending,
-            };
-
-            let mut guard = {
-                let guard = unsafe {
-                    // SAFETY: we received this task from our ready queue,
-                    // so it must be ours.
-                    self.list.access(&task)
-                };
-                match guard {
-                    Some(guard) => guard,
-                    None => continue,
-                }
-            };
-            let waker = task.borrow_waker();
-            let mut cx = Context::from_waker(&waker);
-
-            // If this method panics, the guard will automatically remove the task from the list and drop it.
-            let result = P::poll_progress(guard.get(), ext, ext_mut, &mut cx);
-
-            match result {
-                Poll::Ready(ControlFlow::Continue(item)) => {
-                    guard.forget();
-                    let extra = extra(&task);
-                    self.ready_rx.send(task);
-                    return Poll::Ready(Some((item, extra)));
-                }
-                Poll::Ready(ControlFlow::Break(Some(item))) => {
-                    let extra = extra(&task);
-                    return Poll::Ready(Some((item, extra)));
-                }
-                Poll::Ready(ControlFlow::Break(None)) => {}
-                Poll::Pending => guard.forget(),
-            }
-        }
-
-        if self.list.is_empty() {
-            Poll::Ready(None)
-        } else {
-            Poll::Pending
-        }
+    fn created(&self, task: &Node<T>) -> bool {
+        let this_queue_ptr = Arc::as_ptr(self.queue.queue());
+        let task_queue_ptr = Weak::as_ptr(task.queue());
+        this_queue_ptr == task_queue_ptr
     }
 }
 
-impl<T, P> Stream for Selector<T, P>
-where
-    P: PollProxy<'static, T, (), ()>,
-{
-    type Item = P::Progress;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = unsafe {
-            // SAFETY: no field is ever moved in memory.
-            self.get_unchecked_mut()
-        };
-        this.poll_next_inner(&(), &mut (), |_| (), cx)
-            .map(|opt| opt.map(|(item, ())| item))
-    }
-}
-
-impl<'a, T, P, E, EMut> Pollable<'a, E, EMut> for Selector<T, P>
-where
-    P: PollProxy<'a, T, E, EMut>,
-    E: ?Sized,
-    EMut: ?Sized,
-{
-    type Progress = P::Progress;
-
-    fn poll_progress(
-        self: Pin<&mut Self>,
-        ext: &'a E,
-        ext_mut: &mut EMut,
-        cx: &mut Context<'_>,
-    ) -> Poll<ControlFlow<Option<Self::Progress>, Self::Progress>> {
-        self.get_mut()
-            .with_ext(ext, ext_mut)
-            .poll_next_unpin(cx)
-            .map(|opt| opt.map_or(ControlFlow::Break(None), ControlFlow::Continue))
-    }
-}
-
-impl<T, P> Default for Selector<T, P> {
-    fn default() -> Self {
-        Self {
-            ready_rx: mpsc::Receiver::new(Task::empty),
-            list: Default::default(),
-            _proxy: Default::default(),
-        }
-    }
-}
-
-impl<T, P> fmt::Debug for Selector<T, P> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Selector")
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
-impl<T, P> Extend<T> for Selector<T, P> {
+impl<T, S> Extend<T> for Selector<T, S> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        for pollable in iter {
-            self.push(pollable);
+        for task in iter {
+            self.push(task);
         }
     }
 }
 
-impl<T, P> FromIterator<T> for Selector<T, P> {
+impl<T, S> FromIterator<T> for Selector<T, S>
+where
+    S: Default,
+{
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut this = Self::default();
         this.extend(iter);
@@ -444,150 +240,459 @@ impl<T, P> FromIterator<T> for Selector<T, P> {
     }
 }
 
-impl<T, P> IntoIterator for Selector<T, P> {
-    type IntoIter = IntoIter<T>;
+impl<T, S> IntoIterator for Selector<T, S> {
+    type IntoIter = iter::IntoIter<T>;
     type Item = Removed<T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        IntoIter(self.list)
+        iter::IntoIter(self.list)
     }
 }
+
+impl<'a, T, S> IntoIterator for &'a Selector<T, S> {
+    type IntoIter = iter::Iter<'a, T>;
+    type Item = Borrowed<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T, S> IntoIterator for &'a mut Selector<T, S> {
+    type IntoIter = iter::IterMut<'a, T>;
+    type Item = BorrowedMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<T, S> Stream for Selector<T, S>
+where
+    T: Task<S>,
+    S: Unpin,
+{
+    type Item = T::Output;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        let marker = this.queue.register_waker(cx.waker());
+        if marker.is_null() {
+            return if this.list.is_empty() {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            };
+        }
+
+        while let Some(node) = this.queue.dequeue() {
+            let is_last = Arc::as_ptr(node.get()) == marker;
+
+            let guard = unsafe { this.list.access(node.get()) };
+            let Some(mut guard) = guard else {
+                if is_last {
+                    break;
+                } else {
+                    continue;
+                }
+            };
+
+            let node = node.into_inner();
+
+            let result = {
+                let waker = NodeWaker::new(&node);
+                guard
+                    .borrow_mut()
+                    .get_pin_mut()
+                    .poll_progress(&mut this.strategy, &mut Context::from_waker(&waker))
+            };
+
+            match result {
+                Poll::Ready(ControlFlow::Continue(val)) => {
+                    unsafe {
+                        // SAFETY: node was dequeued from this queue
+                        this.queue.queue().enqueue(node);
+                    }
+                    let output =
+                        T::transform_cont(BorrowedMut(guard.borrow_mut()), &mut this.strategy, val);
+                    guard.forget();
+                    if output.is_some() {
+                        return Poll::Ready(output);
+                    }
+                }
+
+                Poll::Ready(ControlFlow::Break(val)) => {
+                    let node = guard.remove_now();
+                    let output = T::transform_break(Removed(node), &mut this.strategy, val);
+                    if output.is_some() {
+                        return Poll::Ready(output);
+                    }
+                }
+
+                Poll::Pending => {
+                    guard.forget();
+                }
+            }
+
+            if is_last {
+                break;
+            }
+        }
+
+        if this.list.is_empty() {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.list.is_empty().then_some(0))
+    }
+}
+
+impl<T, S> Default for Selector<T, S>
+where
+    S: Default,
+{
+    fn default() -> Self {
+        Self::new(Default::default())
+    }
+}
+
+impl<T, S> fmt::Debug for Selector<T, S>
+where
+    S: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Selector")
+            .field("tasks", &self.list.len())
+            .field("strategy", &self.strategy)
+            .field("queue_ptr", &Arc::as_ptr(self.queue.queue()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T, S> Index<&Id<T>> for Selector<T, S> {
+    type Output = T;
+
+    fn index(&self, id: &Id<T>) -> &Self::Output {
+        self.get(id).expect("task not found").into_pin().get_ref()
+    }
+}
+
+impl<T, S> Index<Id<T>> for Selector<T, S> {
+    type Output = T;
+
+    fn index(&self, id: Id<T>) -> &Self::Output {
+        &self[&id]
+    }
+}
+
+impl<T, S> IndexMut<&Id<T>> for Selector<T, S>
+where
+    T: Unpin,
+{
+    fn index_mut(&mut self, id: &Id<T>) -> &mut Self::Output {
+        self.get_mut(id)
+            .expect("task not found")
+            .into_pin_mut()
+            .get_mut()
+    }
+}
+
+impl<T, S> IndexMut<Id<T>> for Selector<T, S>
+where
+    T: Unpin,
+{
+    fn index_mut(&mut self, id: Id<T>) -> &mut Self::Output {
+        &mut self[&id]
+    }
+}
+
+unsafe impl<T, S> Send for Selector<T, S>
+where
+    T: Send,
+    S: Send,
+{
+}
+
+unsafe impl<T, S> Sync for Selector<T, S>
+where
+    T: Sync,
+    S: Sync,
+{
+}
+
+static_assertions::assert_impl_all!(Selector<(), ()>: Send, Sync);
+static_assertions::assert_impl_all!(Selector<Cell<()>, Cell<()>>: Send);
+static_assertions::assert_not_impl_any!(Selector<Cell<()>, ()>: Sync);
+static_assertions::assert_not_impl_any!(Selector<(), Cell<()>>: Sync);
+static_assertions::assert_not_impl_any!(Selector<Rc<()>, ()>: Send, Sync);
+static_assertions::assert_not_impl_any!(Selector<(), Rc<()>>: Send, Sync);
 
 #[cfg(test)]
 mod test {
     use std::{
-        ops::Not,
-        panic::{AssertUnwindSafe, catch_unwind},
+        ops::ControlFlow,
+        panic::AssertUnwindSafe,
         pin::Pin,
         sync::Arc,
         task::{Context, Poll, Waker},
     };
 
-    use futures::{FutureExt, StreamExt, channel::oneshot, task::AtomicWaker};
-    use rstest::rstest;
+    use futures::{FutureExt, StreamExt};
 
-    use crate::{pollable::PollFuture, selector::Selector};
+    use crate::{
+        FutureSelector, StreamSelector,
+        selector::{BorrowedMut, Removed, Selector},
+        task::Task,
+    };
 
-    #[tokio::test]
-    async fn basic() {
-        let (tx, rx) = oneshot::channel::<()>();
-        let mut selector = Selector::<_, PollFuture>::default();
-        selector.push(rx);
-        assert!(selector.next().now_or_never().is_none());
-        assert_eq!(selector.len(), 1);
-        tx.send(()).unwrap();
-        assert!(selector.next().await.is_some());
-        assert_eq!(selector.len(), 0);
+    #[test]
+    fn retain_removes_correct_tasks() {
+        let mut selector = (-3_i32..=3).collect::<FutureSelector<_>>();
+        selector.retain(|task| task.is_positive());
+        let retained = selector
+            .into_iter()
+            .map(Removed::into_inner)
+            .collect::<Vec<_>>();
+        assert_eq!(retained, &[1, 2, 3],);
     }
 
-    /// Verifies that [`Selector`] respects the inner item's yield when polled,
-    /// and does not poll the same item twice in a single [`Selector::poll_next_with_ext`] call.
-    #[rstest]
-    #[tokio::test]
-    async fn task_yield_is_respected(#[values(1, 4, 8)] futures: usize) {
-        struct Fut {
-            polled: bool,
-        }
+    #[test]
+    fn extract_if_removes_correct_tasks() {
+        let mut selector = (-3_i32..=3).collect::<FutureSelector<_>>();
+        let iter = selector.extract_if(|task| task.is_positive());
+        assert_eq!(
+            iter.map(Removed::into_inner).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+        );
+        let retained = selector
+            .into_iter()
+            .map(Removed::into_inner)
+            .collect::<Vec<_>>();
+        assert_eq!(retained, &[-3, -2, -1, 0],);
+    }
 
-        impl Future for Fut {
+    #[test]
+    fn extract_if_retains_tasks_when_dropped() {
+        let mut selector = (-3_i32..=3).collect::<FutureSelector<_>>();
+        let iter = selector.extract_if(|task| task.is_positive());
+        assert_eq!(
+            iter.take(1).map(Removed::into_inner).collect::<Vec<_>>(),
+            vec![1],
+        );
+        let retained = selector
+            .into_iter()
+            .map(Removed::into_inner)
+            .collect::<Vec<_>>();
+        assert_eq!(retained, &[-3, -2, -1, 0, 2, 3],);
+    }
+
+    #[test]
+    fn single_selector_poll_polls_each_task_at_most_once() {
+        #[derive(Clone)]
+        struct Task(usize);
+
+        impl Future for Task {
             type Output = ();
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let this = self.get_mut();
-                if this.polled.not() {
-                    this.polled = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                } else {
-                    Poll::Ready(())
-                }
-            }
-        }
-
-        let mut selector = Selector::<_, PollFuture>::default();
-        for _ in 0..futures {
-            selector.push(Fut { polled: false });
-        }
-
-        assert!(
-            selector
-                .poll_next_unpin(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        for fut in selector.iter() {
-            assert!(fut.polled);
-        }
-
-        for _ in 0..futures {
-            assert_eq!(
-                selector.poll_next_unpin(&mut Context::from_waker(Waker::noop())),
-                Poll::Ready(Some(())),
-            );
-        }
-    }
-
-    #[test]
-    fn stale_wakeups_on_removed_tasks_still_report_empty_selector() {
-        struct StoreWaker(Arc<AtomicWaker>);
-
-        impl Future for StoreWaker {
-            type Output = usize;
-
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                self.0.register(cx.waker());
+                this.0 += 1;
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }
         }
 
-        let slot = Arc::new(AtomicWaker::new());
-        let mut selector = Selector::<_, PollFuture>::default();
-        let id = selector.push_with_id(StoreWaker(slot.clone()).boxed());
-        let mut cx = Context::from_waker(Waker::noop());
-
-        assert!(selector.poll_next_unpin(&mut cx).is_pending());
-        let waker = slot.take().unwrap();
-        let _ = selector.remove(&id).unwrap();
-        assert!(selector.is_empty());
-
-        for _ in 0..3 {
-            waker.wake_by_ref();
-            assert_eq!(selector.poll_next_unpin(&mut cx), Poll::Ready(None));
+        let mut selector = std::iter::repeat_n(Task(0), 3).collect::<FutureSelector<_>>();
+        for i in 0..=3 {
+            selector
+                .iter()
+                .for_each(|borrowed| assert_eq!(borrowed.get_pin().0, i));
+            assert!(
+                selector
+                    .poll_next_unpin(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         }
-
-        selector.push(std::future::ready(7).boxed());
-        assert_eq!(selector.poll_next_unpin(&mut cx), Poll::Ready(Some(7)));
-        assert_eq!(selector.poll_next_unpin(&mut cx), Poll::Ready(None));
     }
 
-    #[test]
-    fn panicking_task_is_removed_and_selector_remains_valid() {
-        struct PanicOnPoll {
-            _shared: Arc<()>,
-        }
+    #[tokio::test]
+    async fn selector_respects_strategy_and_round_robin_order() {
+        #[derive(Clone)]
+        struct MyTask(usize);
 
-        impl Future for PanicOnPoll {
+        impl Task for MyTask {
+            type Cont = usize;
+            type Break = usize;
             type Output = usize;
 
-            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-                panic!("boom");
+            fn poll_progress(
+                self: Pin<&mut Self>,
+                _: &mut (),
+                _: &mut Context<'_>,
+            ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
+                let state = self.get_mut();
+                state.0 += 1;
+                if state.0 > 5 {
+                    Poll::Ready(ControlFlow::Break(state.0))
+                } else {
+                    Poll::Ready(ControlFlow::Continue(state.0))
+                }
+            }
+
+            fn transform_cont(
+                _: BorrowedMut<'_, Self>,
+                _: &mut (),
+                value: Self::Cont,
+            ) -> Option<Self::Output> {
+                value.is_power_of_two().then_some(value)
+            }
+
+            fn transform_break(
+                _: Removed<Self>,
+                _: &mut (),
+                value: Self::Break,
+            ) -> Option<Self::Output> {
+                Some(value * 2)
             }
         }
 
-        let drops = Arc::new(());
-        let drops_weak = Arc::downgrade(&drops);
-        let mut selector = Selector::<_, PollFuture>::default();
-        selector.push(PanicOnPoll { _shared: drops }.boxed());
+        let selector = std::iter::repeat_n(MyTask(0), 3).collect::<Selector<_, ()>>();
+        let results = selector.collect::<Vec<_>>().await;
+        assert_eq!(results, vec![1, 1, 1, 2, 2, 2, 4, 4, 4, 12, 12, 12],);
+    }
 
-        let mut cx = Context::from_waker(Waker::noop());
-        let result = catch_unwind(AssertUnwindSafe(|| selector.poll_next_unpin(&mut cx)));
+    #[tokio::test]
+    async fn selector_returns_valid_ids() {
+        let mut selector = StreamSelector::default();
+        let id_0 = selector.push(futures::stream::repeat(0)).id().clone();
+        let id_1 = selector.push(futures::stream::repeat(1)).id().clone();
+        assert!(selector.contains(&id_0));
+        assert!(selector.contains(&id_1));
+        assert_eq!(selector.next().await.unwrap(), 0);
+        assert_eq!(selector.next().await.unwrap(), 1);
+        assert_eq!(selector.next().await.unwrap(), 0);
+        assert_eq!(selector.next().await.unwrap(), 1);
+        selector.remove(&id_0);
+        assert_eq!(selector.next().await.unwrap(), 1);
+        assert_eq!(selector.next().await.unwrap(), 1);
+    }
 
-        assert!(result.is_err());
-        assert!(selector.is_empty());
+    #[tokio::test]
+    async fn selector_handles_strategy_panic() {
+        struct MyTask(usize);
+
+        impl Task for MyTask {
+            type Cont = usize;
+            type Break = usize;
+            type Output = usize;
+
+            fn poll_progress(
+                self: Pin<&mut Self>,
+                _: &mut (),
+                _: &mut Context<'_>,
+            ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
+                match self.0 {
+                    1 => panic!("poll panic"),
+                    2 => Poll::Ready(ControlFlow::Continue(2)),
+                    n => Poll::Ready(ControlFlow::Break(n)),
+                }
+            }
+
+            fn transform_cont(
+                _: BorrowedMut<'_, Self>,
+                _: &mut (),
+                _: Self::Cont,
+            ) -> Option<Self::Output> {
+                panic!("cont panic")
+            }
+
+            fn transform_break(
+                _: Removed<Self>,
+                _: &mut (),
+                value: Self::Break,
+            ) -> Option<Self::Output> {
+                if value == 3 {
+                    panic!("break panic")
+                } else {
+                    Some(value)
+                }
+            }
+        }
+
+        let mut selector = (0..=4).map(MyTask).collect::<Selector<_, ()>>();
+        assert_eq!(selector.len(), 5);
+
+        assert_eq!(selector.next().await.unwrap(), 0);
+        assert_eq!(selector.len(), 4);
+
+        let err = AssertUnwindSafe(selector.next())
+            .catch_unwind()
+            .await
+            .unwrap_err();
+        assert_eq!(*err.downcast_ref::<&'static str>().unwrap(), "poll panic",);
+        assert_eq!(selector.len(), 3);
+
+        let err = AssertUnwindSafe(selector.next())
+            .catch_unwind()
+            .await
+            .unwrap_err();
+        assert_eq!(*err.downcast_ref::<&'static str>().unwrap(), "cont panic",);
+        assert_eq!(selector.len(), 2);
+
+        let err = AssertUnwindSafe(selector.next())
+            .catch_unwind()
+            .await
+            .unwrap_err();
+        assert_eq!(*err.downcast_ref::<&'static str>().unwrap(), "break panic",);
+        assert_eq!(selector.len(), 1);
+
+        assert_eq!(selector.next().await.unwrap(), 4);
         assert_eq!(selector.len(), 0);
-        assert!(drops_weak.upgrade().is_none());
+    }
 
-        selector.push(std::future::ready(11).boxed());
-        assert_eq!(selector.poll_next_unpin(&mut cx), Poll::Ready(Some(11)));
-        assert_eq!(selector.poll_next_unpin(&mut cx), Poll::Ready(None));
+    #[tokio::test]
+    async fn selector_handles_drop_panic() {
+        struct Task(usize);
+
+        impl Future for Task {
+            type Output = usize;
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(self.0)
+            }
+        }
+
+        impl Drop for Task {
+            fn drop(&mut self) {
+                if self.0 < 2 {
+                    panic!();
+                }
+            }
+        }
+
+        let mut selector = (0..3).map(Task).collect::<FutureSelector<_>>();
+        let ids = selector
+            .iter()
+            .map(|task| task.id().clone())
+            .collect::<Vec<_>>();
+
+        AssertUnwindSafe(selector.next())
+            .catch_unwind()
+            .await
+            .unwrap_err();
+        assert_eq!(selector.len(), 2);
+        assert_eq!(Arc::strong_count(ids[0].get()), 1);
+
+        let selector = AssertUnwindSafe(selector);
+        std::panic::catch_unwind(|| drop(selector)).unwrap_err();
+
+        for id in ids {
+            assert_eq!(Arc::strong_count(id.get()), 1);
+        }
     }
 }

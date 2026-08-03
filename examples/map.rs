@@ -35,7 +35,7 @@ async fn main() {
     assert_eq!(map.next().await.unwrap(), (3, 444));
     assert!(map.next().now_or_never().is_none());
 
-    map.get_mut(&4).unwrap().get_mut().get_mut().stream.close();
+    map.get_mut(&4).unwrap().get_pin_mut().stream.close();
     assert!(senders[4].is_closed());
 }
 
@@ -55,10 +55,14 @@ where
     S: Stream,
 {
     pub fn insert(&mut self, key: K, stream: S) -> Option<Removed<NotifyEnd<S, K>>> {
-        let id = self.selector.push_with_id(NotifyEnd {
-            stream,
-            key: Some(key.clone()),
-        });
+        let id = self
+            .selector
+            .push(NotifyEnd {
+                stream,
+                key: Some(key.clone()),
+            })
+            .id()
+            .clone();
         let prev = self.keys.insert(key, id);
         prev.and_then(|id| self.selector.remove(&id))
     }

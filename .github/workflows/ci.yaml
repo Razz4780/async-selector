@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: ["", "--release"]
+        profile: ["dev", "release"]
     steps:
       - uses: actions/checkout@v4
 
@@ -39,10 +39,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Check clippy
-        run: cargo clippy --all-targets ${{ matrix.profile }} -- -D warnings
+        run: cargo clippy --all-targets --profile ${{ matrix.profile }} -- -D warnings
 
       - name: Build targets
-        run: cargo build ${{ matrix.profile }} --all-targets
+        run: cargo build --profile ${{ matrix.profile }} --all-targets
 
       - name: Run unit tests
-        run: cargo test ${{ matrix.profile }}
+        run: cargo test --profile ${{ matrix.profile }}

@@ -2,14 +2,15 @@ use std::{
     cell::UnsafeCell,
     mem::{ManuallyDrop, MaybeUninit},
     ops::Not,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, AtomicPtr, Ordering},
-    },
+    sync::{Arc, Weak},
     task::Waker,
 };
 
 use futures::task::AtomicWaker;
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Receiver handle for a [`Queue`].
 ///
@@ -357,6 +358,37 @@ mod test {
     use tokio::sync::Barrier as TokioBarrier;
 
     use crate::queue::Receiver;
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_concurrent_enqueues_work() {
+        loom::model(|| {
+            let mut receiver = Receiver::default();
+            let queue = receiver.queue().clone();
+            let first = queue.create(1);
+            let second = queue.create(2);
+
+            let first_sender = loom::thread::spawn(move || first.enqueue());
+            let second_sender = loom::thread::spawn(move || second.enqueue());
+
+            let mut values = Vec::new();
+            while values.len() < 2 {
+                let Some(node) = receiver.dequeue() else {
+                    loom::thread::yield_now();
+                    continue;
+                };
+                values.push(*node.get().value());
+            }
+
+            first_sender.join().unwrap();
+            second_sender.join().unwrap();
+
+            assert!(receiver.dequeue().is_none());
+
+            values.sort_unstable();
+            assert_eq!(values, [1, 2]);
+        });
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn snapshots_work() {

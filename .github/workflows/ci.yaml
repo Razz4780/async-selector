@@ -64,3 +64,10 @@ jobs:
 
       - name: Run Miri
         run: cargo +nightly miri test --lib
+
+      - name: Run concurrent queue test with multiple schedules
+        env:
+          MIRIFLAGS: -Zmiri-many-seeds=0..16
+        run: >
+          cargo +nightly miri test --lib
+          queue::test::concurrent_enqueues_work

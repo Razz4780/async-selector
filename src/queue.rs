@@ -212,23 +212,29 @@ impl<T> Drop for Queue<T> {
 
         impl<T> Drop for Guard<T> {
             fn drop(&mut self) {
-                // If one of the nodes panics on drop, `inner` guard will continue the work.
-                // If we're already in `inner` the process will be aborted.
-                // This behavior is the same as std LinkedList.
                 let mut inner = Self {
                     stub: self.stub,
                     tail: self.tail,
                 };
 
                 while inner.tail.is_null().not() {
+                    // `tail` may contain an old pointer tag for the embedded
+                    // stub. Use the fresh pointer created inside Queue::drop.
+                    // This makes Miri happy.
+                    if std::ptr::eq(inner.tail, inner.stub) {
+                        inner.tail = unsafe { &*inner.stub }
+                            .next_enqueued
+                            .load(Ordering::Acquire);
+                        continue;
+                    }
+
                     let next = unsafe { &*inner.tail }
                         .next_enqueued
                         .load(Ordering::Acquire);
                     let to_drop = inner.tail;
                     inner.tail = next;
-                    if to_drop != inner.stub {
-                        let _ = unsafe { Arc::from_raw(to_drop) };
-                    }
+
+                    let _ = unsafe { Arc::from_raw(to_drop) };
                 }
 
                 let _ = ManuallyDrop::new(inner);
@@ -355,7 +361,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn snapshots_work() {
         const SENDERS: usize = 4;
-        const ITERATIONS: usize = 16 * 1024;
+        const ITERATIONS: usize = if cfg!(miri) { 32 } else { 16 * 1024 };
 
         let mut queue = Receiver::<usize>::default();
         let barrier = Arc::new(TokioBarrier::new(SENDERS + 1));
@@ -409,7 +415,7 @@ mod test {
     #[test]
     fn concurrent_enqueues_work() {
         const SENDERS: usize = 4;
-        const ITERATIONS: usize = 16 * 1024;
+        const ITERATIONS: usize = if cfg!(miri) { 32 } else { 16 * 1024 };
 
         let mut queue = Receiver::<usize>::default();
         let barrier = Arc::new(Barrier::new(SENDERS + 1));

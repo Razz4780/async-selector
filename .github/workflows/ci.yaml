@@ -46,3 +46,21 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --profile ${{ matrix.profile }}
+
+  miri:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Miri
+        run: |
+          rustup toolchain install nightly \
+            --allow-downgrade \
+            --profile minimal \
+            --component miri
+          cargo +nightly miri setup
+
+      - name: Run Miri
+        run: cargo +nightly miri test --lib

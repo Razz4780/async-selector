@@ -355,7 +355,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn snapshots_work() {
         const SENDERS: usize = 4;
-        const ITERATIONS: usize = 16 * 1024;
+        const ITERATIONS: usize = if cfg!(miri) { 32 } else { 16 * 1024 };
 
         let mut queue = Receiver::<usize>::default();
         let barrier = Arc::new(TokioBarrier::new(SENDERS + 1));
@@ -409,7 +409,7 @@ mod test {
     #[test]
     fn concurrent_enqueues_work() {
         const SENDERS: usize = 4;
-        const ITERATIONS: usize = 16 * 1024;
+        const ITERATIONS: usize = if cfg!(miri) { 32 } else { 16 * 1024 };
 
         let mut queue = Receiver::<usize>::default();
         let barrier = Arc::new(Barrier::new(SENDERS + 1));

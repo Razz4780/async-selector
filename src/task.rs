@@ -18,6 +18,99 @@ pub mod strategy;
 /// Unless you want to customize [`Selector`](crate::Selector)'s behavior,
 /// you don't have to manually implement this trait.
 /// You can use one of ready-to-go strategies from [`strategy`].
+///
+/// # Custom task example
+///
+/// The example below polls a set of [`UdpSocket`](https://docs.rs/tokio/latest/tokio/net/struct.UdpSocket.html)s
+/// for incoming datagrams.
+///
+/// Note that:
+/// 1. [`UdpSocket`](https://docs.rs/tokio/latest/tokio/net/struct.UdpSocket.html) is an external type,
+///    and so is this trait (from the perspective of the implementing crate).
+///    The local strategy type makes the implementation possible.
+/// 2. The strategy holds the receive buffer, so the whole selector needs only one,
+///    no matter how many sockets it holds. Each datagram is copied out of the shared buffer
+///    in [`Task::transform_cont`], before the next poll can overwrite it.
+/// 3. A failed socket is removed from the selector, because the failure is reported
+///    with [`ControlFlow::Break`].
+///
+/// ```
+/// # use std::{
+/// #     io,
+/// #     mem::MaybeUninit,
+/// #     net::SocketAddr,
+/// #     ops::ControlFlow,
+/// #     pin::Pin,
+/// #     task::{Context, Poll, ready},
+/// # };
+/// # use async_selector::{
+/// #     selector::{BorrowedMut, Removed, Selector},
+/// #     task::Task,
+/// # };
+/// # use futures::StreamExt;
+/// # use tokio::{io::ReadBuf, net::UdpSocket};
+/// /// Receive buffer shared by all sockets in the selector.
+/// ///
+/// /// Large enough to hold any datagram.
+/// struct RecvBuffer(Box<[MaybeUninit<u8>; u16::MAX as usize]>);
+///
+/// impl Task<RecvBuffer> for UdpSocket {
+///     /// Address of the peer and length of the datagram,
+///     /// which sits in the shared buffer.
+///     type Cont = (SocketAddr, Vec<u8>);
+///     /// Fatal socket error.
+///     type Break = io::Error;
+///     type Output = io::Result<(SocketAddr, Vec<u8>)>;
+///
+///     fn poll_progress(
+///         self: Pin<&mut Self>,
+///         buffer: &mut RecvBuffer,
+///         cx: &mut Context<'_>,
+///     ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
+///         let mut buf = ReadBuf::uninit(buffer.0.as_mut_slice());
+///         match ready!(self.poll_recv_from(cx, &mut buf)) {
+///             Ok(peer) => Poll::Ready(ControlFlow::Continue((peer, buf.filled().to_vec()))),
+///             Err(error) => Poll::Ready(ControlFlow::Break(error)),
+///         }
+///     }
+///
+///     fn transform_cont(
+///         _: BorrowedMut<'_, Self>,
+///         buffer: &mut RecvBuffer,
+///         value: Self::Cont,
+///     ) -> Option<Self::Output> {
+///         Some(Ok(value))
+///     }
+///
+///     fn transform_break(
+///         _: Removed<Self>,
+///         _: &mut RecvBuffer,
+///         error: Self::Break,
+///     ) -> Option<Self::Output> {
+///         Some(Err(error))
+///     }
+/// }
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> io::Result<()> {
+/// let mut selector = Selector::new(RecvBuffer(Box::new([MaybeUninit::uninit(); u16::MAX as usize])));
+/// let mut addrs = Vec::new();
+/// for _ in 0..2 {
+///     let socket = UdpSocket::bind("127.0.0.1:0").await?;
+///     addrs.push(socket.local_addr()?);
+///     selector.push(socket);
+/// }
+///
+/// let sender = UdpSocket::bind("127.0.0.1:0").await?;
+/// for addr in &addrs {
+///     sender.send_to(b"hello", addr).await?;
+///     let (peer, data) = selector.next().await.unwrap()?;
+///     assert_eq!(peer, sender.local_addr()?);
+///     assert_eq!(data, b"hello");
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub trait Task<S: ?Sized = ()>: Sized {
     /// Type returned from [`Self::poll_progress`]
     /// when the task produces some value, but has not finished yet.

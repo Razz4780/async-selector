@@ -80,10 +80,10 @@ The results below were obtained with:
 
 **Scenario 1**: concurrently drain 32 instances, each draining 1k streams, each stream producing 16k values (yielding once before producing each value)
 
-* `StreamSelector` - 2.522s
-* `SelectAll` - 5.979s
+* `StreamSelector` - 1.078s
+* `SelectAll` - 3.956s
 
 **Scenario 2**: concurrnently drain 32 instances, each resolving 1k futures, each future yielding 16k times
 
-* `FutureSelector` - 1.479s
-* `FuturesUnordered` - 4.416s
+* `FutureSelector` - 0.859s
+* `FuturesUnordered` - 2.748s

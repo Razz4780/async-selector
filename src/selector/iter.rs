@@ -2,34 +2,34 @@
 
 use crate::{
     list::{Cursor, List},
-    selector::{Borrowed, BorrowedMut, Removed},
+    selector::{Borrowed, BorrowedMut, Removed, Tasks},
 };
 
 /// Returned from [`Selector::into_iter`](super::Selector::into_iter).
-pub struct IntoIter<T>(pub(super) List<T>);
+pub struct IntoIter<T>(pub(super) Tasks<T>);
 
 impl<T> Iterator for IntoIter<T> {
     type Item = Removed<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.cursor_mut().remove_front().map(Removed)
+        self.0.list.cursor_mut().remove_front().map(Removed)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.0.len();
+        let len = self.0.list.len();
         (len, Some(len))
     }
 }
 
 impl<T> ExactSizeIterator for IntoIter<T> {
     fn len(&self) -> usize {
-        self.0.len()
+        self.0.list.len()
     }
 }
 
 impl<T> DoubleEndedIterator for IntoIter<T> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.0.cursor_mut().remove_back().map(Removed)
+        self.0.list.cursor_mut().remove_back().map(Removed)
     }
 }
 

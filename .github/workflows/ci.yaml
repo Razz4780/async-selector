@@ -87,5 +87,4 @@ jobs:
         env:
           RUSTFLAGS: --cfg loom
         run: >
-          cargo test --release --lib
-          queue::test::loom_concurrent_enqueues_work
+          cargo test --release --lib loom

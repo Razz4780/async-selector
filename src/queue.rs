@@ -831,7 +831,8 @@ mod test {
 
             sender.join().unwrap();
             if !seen {
-                assert!(receiver.dequeue().is_some(), "lost wakeup");
+                let again = receiver.dequeue().expect("lost wakeup");
+                assert!(unsafe { again.into_live() }.is_some());
             }
 
             unsafe { node.retire() };

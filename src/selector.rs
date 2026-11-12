@@ -69,10 +69,12 @@ pub use crate::selector::{
 /// If the [`Task`] implementation panics, the task is removed from the selector and dropped,
 /// and the panic propagates. The selector remains valid.
 pub struct Selector<T, S> {
+    /// List of all tasks.
+    ///
+    /// Must be dropped before the queue (see [`Receiver`]).
+    list: List<T>,
     /// Queue of tasks that received a wakeup.
     queue: Receiver<list::ListProtected<T>>,
-    /// List of all tasks.
-    list: List<T>,
     /// Strategy that determines how the selector polls the tasks.
     strategy: S,
 }
@@ -211,7 +213,12 @@ impl<T, S> Selector<T, S> {
 
     /// Manually wakes all tasks in the selector.
     pub fn wake_all(&self) {
-        self.iter().for_each(|task| task.id().wake());
+        let queue = self.queue.queue();
+        self.iter().for_each(|task| unsafe {
+            // SAFETY: the task was created from this queue.
+            queue.enqueue_silent(task.id().get());
+        });
+        queue.notify();
     }
 
     fn created(&self, task: &Node<T>) -> bool {
@@ -245,7 +252,10 @@ impl<T, S> IntoIterator for Selector<T, S> {
     type Item = Removed<T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        iter::IntoIter(self.list)
+        iter::IntoIter {
+            list: self.list,
+            _queue: self.queue,
+        }
     }
 }
 
@@ -277,74 +287,86 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        let marker = this.queue.register_waker(cx.waker());
-        if marker.is_null() {
-            return if this.list.is_empty() {
-                Poll::Ready(None)
-            } else {
-                Poll::Pending
-            };
-        }
+        let marker = this.queue.marker();
+        if marker.is_null().not() {
+            while let Some(dequeued) = this.queue.dequeue() {
+                let is_last = dequeued.as_ptr() == marker;
 
-        while let Some(node) = this.queue.dequeue() {
-            let is_last = Arc::as_ptr(node.get()) == marker;
+                let node = unsafe {
+                    // SAFETY: nodes are kept alive by the list until they are retired.
+                    dequeued.into_live()
+                };
+                let Some(node) = node else {
+                    // Task was removed.
+                    if is_last {
+                        break;
+                    } else {
+                        continue;
+                    }
+                };
 
-            let guard = unsafe { this.list.access(node.get()) };
-            let Some(mut guard) = guard else {
+                let mut guard = unsafe {
+                    // SAFETY: node was dequeued from our queue and is not retired,
+                    // so it is stored in our list.
+                    this.list.access(&node)
+                };
+
+                let result = {
+                    let waker = NodeWaker::new(&node);
+                    guard
+                        .borrow_mut()
+                        .get_pin_mut()
+                        .poll_progress(&mut this.strategy, &mut Context::from_waker(&waker))
+                };
+
+                match result {
+                    Poll::Ready(ControlFlow::Continue(val)) => {
+                        unsafe {
+                            // SAFETY: node was dequeued from this queue and is not retired
+                            this.queue.requeue(&node);
+                        }
+                        let output = T::transform_cont(
+                            BorrowedMut(guard.borrow_mut()),
+                            &mut this.strategy,
+                            val,
+                        );
+                        guard.forget();
+                        if output.is_some() {
+                            return Poll::Ready(output);
+                        }
+                    }
+
+                    Poll::Ready(ControlFlow::Break(val)) => {
+                        let node = guard.remove_now();
+                        let output = T::transform_break(Removed(node), &mut this.strategy, val);
+                        if output.is_some() {
+                            return Poll::Ready(output);
+                        }
+                    }
+
+                    Poll::Pending => {
+                        guard.forget();
+                    }
+                }
+
                 if is_last {
                     break;
-                } else {
-                    continue;
                 }
-            };
-
-            let node = node.into_inner();
-
-            let result = {
-                let waker = NodeWaker::new(&node);
-                guard
-                    .borrow_mut()
-                    .get_pin_mut()
-                    .poll_progress(&mut this.strategy, &mut Context::from_waker(&waker))
-            };
-
-            match result {
-                Poll::Ready(ControlFlow::Continue(val)) => {
-                    unsafe {
-                        // SAFETY: node was dequeued from this queue
-                        this.queue.queue().enqueue(node);
-                    }
-                    let output =
-                        T::transform_cont(BorrowedMut(guard.borrow_mut()), &mut this.strategy, val);
-                    guard.forget();
-                    if output.is_some() {
-                        return Poll::Ready(output);
-                    }
-                }
-
-                Poll::Ready(ControlFlow::Break(val)) => {
-                    let node = guard.remove_now();
-                    let output = T::transform_break(Removed(node), &mut this.strategy, val);
-                    if output.is_some() {
-                        return Poll::Ready(output);
-                    }
-                }
-
-                Poll::Pending => {
-                    guard.forget();
-                }
-            }
-
-            if is_last {
-                break;
             }
         }
 
         if this.list.is_empty() {
-            Poll::Ready(None)
-        } else {
-            Poll::Pending
+            return Poll::Ready(None);
         }
+
+        // We only get here when we have nothing to yield.
+        // 1. If there may be tasks waiting in the queue (we finished the pass over the snapshot,
+        //    or an enqueue is in progress), yield to the executor and come back.
+        // 2. Otherwise, go to sleep. This is the only place where we register the waker.
+        if this.queue.has_pending() || this.queue.park(cx.waker()).not() {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -435,7 +457,7 @@ static_assertions::assert_not_impl_any!(Selector<(), Rc<()>>: Send, Sync);
 #[cfg(test)]
 mod test {
     use std::{
-        ops::ControlFlow,
+        ops::{ControlFlow, Not},
         panic::AssertUnwindSafe,
         pin::Pin,
         sync::Arc,
@@ -653,6 +675,210 @@ mod test {
 
         assert_eq!(selector.next().await.unwrap(), 4);
         assert_eq!(selector.len(), 0);
+    }
+
+    /// Stream fed from other threads.
+    #[derive(Default)]
+    struct Feed {
+        ready: std::sync::atomic::AtomicUsize,
+        waker: std::sync::Mutex<Option<Waker>>,
+    }
+
+    impl Feed {
+        fn send(&self, by_ref: bool) {
+            self.ready.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if by_ref {
+                if let Some(waker) = &*self.waker.lock().unwrap() {
+                    waker.wake_by_ref();
+                }
+            } else {
+                let waker = self.waker.lock().unwrap().take();
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
+        }
+    }
+
+    struct FeedStream(Arc<Feed>);
+
+    impl futures::Stream for FeedStream {
+        type Item = ();
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            use std::sync::atomic::Ordering;
+
+            let take = |feed: &Feed| {
+                feed.ready
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            };
+            if take(&self.0) {
+                return Poll::Ready(Some(()));
+            }
+            *self.0.waker.lock().unwrap() = Some(cx.waker().clone());
+            if take(&self.0) {
+                Poll::Ready(Some(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    struct ThreadWaker(std::thread::Thread, std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.unpark();
+        }
+    }
+
+    /// Tasks are woken from other threads while the selector goes to sleep and wakes up.
+    /// If a wakeup is lost, this test hangs.
+    #[test]
+    fn cross_thread_wakeups_are_not_lost() {
+        use std::sync::atomic::Ordering;
+
+        const SENDERS: usize = 3;
+        const FEEDS_PER_SENDER: usize = 4;
+        const ITEMS_PER_FEED: usize = if cfg!(miri) { 16 } else { 20_000 };
+
+        let feeds = std::iter::repeat_with(|| Arc::new(Feed::default()))
+            .take(SENDERS * FEEDS_PER_SENDER)
+            .collect::<Vec<_>>();
+        let mut selector = feeds
+            .iter()
+            .cloned()
+            .map(FeedStream)
+            .collect::<StreamSelector<_>>();
+        let nodes = selector
+            .iter()
+            .map(|task| Arc::downgrade(task.id().get()))
+            .collect::<Vec<_>>();
+
+        let senders = feeds
+            .chunks(FEEDS_PER_SENDER)
+            .map(|feeds| {
+                let feeds = feeds.to_vec();
+                std::thread::spawn(move || {
+                    for i in 0..ITEMS_PER_FEED {
+                        for feed in &feeds {
+                            feed.send(i % 2 == 0);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let thread_waker = Arc::new(ThreadWaker(std::thread::current(), true.into()));
+        let waker = Waker::from(thread_waker.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut remaining = feeds.len() * ITEMS_PER_FEED;
+        while remaining > 0 {
+            while thread_waker.1.swap(false, Ordering::SeqCst).not() {
+                std::thread::park();
+            }
+            while let Poll::Ready(item) = selector.poll_next_unpin(&mut cx) {
+                item.unwrap();
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+
+        senders
+            .into_iter()
+            .for_each(|sender| sender.join().unwrap());
+        assert!(selector.poll_next_unpin(&mut cx).is_pending());
+        drop(selector);
+        drop(feeds);
+        for node in nodes {
+            assert!(node.upgrade().is_none(), "node leaked");
+        }
+    }
+
+    /// Tasks are woken from other threads while they are removed from the selector,
+    /// and while the selector is dropped. Nothing should leak (or crash).
+    #[test]
+    fn cross_thread_wakeups_race_with_removal_and_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const SENDERS: usize = 3;
+        const FEEDS_PER_SENDER: usize = 4;
+        const ROUNDS: usize = if cfg!(miri) { 4 } else { 300 };
+
+        for round in 0..ROUNDS {
+            let feeds = std::iter::repeat_with(|| Arc::new(Feed::default()))
+                .take(SENDERS * FEEDS_PER_SENDER)
+                .collect::<Vec<_>>();
+            let mut selector = feeds
+                .iter()
+                .cloned()
+                .map(FeedStream)
+                .collect::<crate::StreamWithIdSelector<_>>();
+            let ids = selector
+                .iter()
+                .map(|task| task.id().clone())
+                .collect::<Vec<_>>();
+            let nodes = ids
+                .iter()
+                .map(|id| Arc::downgrade(id.get()))
+                .collect::<Vec<_>>();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let senders = feeds
+                .chunks(FEEDS_PER_SENDER)
+                .map(|feeds| {
+                    let feeds = feeds.to_vec();
+                    let stop = stop.clone();
+                    std::thread::spawn(move || {
+                        let mut i = 0_usize;
+                        while stop.load(Ordering::Relaxed).not() {
+                            for feed in &feeds {
+                                feed.send(i % 2 == 0);
+                            }
+                            i += 1;
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut cx = Context::from_waker(Waker::noop());
+            let poll_some = |selector: &mut crate::StreamWithIdSelector<FeedStream>,
+                             cx: &mut Context<'_>| {
+                for _ in 0..(50 + round) {
+                    let _ = selector.poll_next_unpin(cx);
+                }
+            };
+
+            poll_some(&mut selector, &mut cx);
+            for id in ids.iter().step_by(2) {
+                assert!(selector.remove(id).is_some());
+            }
+            poll_some(&mut selector, &mut cx);
+            selector.wake_all();
+            poll_some(&mut selector, &mut cx);
+            if round % 2 == 0 {
+                drop(selector);
+            } else {
+                drop(selector.into_iter().next());
+            }
+
+            stop.store(true, Ordering::Relaxed);
+            senders
+                .into_iter()
+                .for_each(|sender| sender.join().unwrap());
+            drop(ids);
+            for feed in &feeds {
+                assert_eq!(Arc::strong_count(feed), 1, "task leaked");
+                feed.waker.lock().unwrap().take();
+            }
+            for node in nodes {
+                assert!(node.upgrade().is_none(), "node leaked");
+            }
+        }
     }
 
     #[tokio::test]

@@ -93,13 +93,13 @@
 //!
 //! **Scenario 1**: concurrently drain 32 instances, each draining 1k streams, each stream producing 16k values (yielding once before producing each value)
 //!
-//! * [`StreamSelector`] - 2.522s
-//! * [`SelectAll`](futures::stream::SelectAll) - 5.979s
+//! * [`StreamSelector`] - 840.710ms
+//! * [`SelectAll`](futures::stream::SelectAll) - 3.763s
 //!
 //! **Scenario 2**: concurrently drain 32 instances, each resolving 1k futures, each future yielding 16k times
 //!
-//! * [`FutureSelector`] - 1.479s
-//! * [`FuturesUnordered`](futures::stream::FuturesUnordered) - 4.416s
+//! * [`FutureSelector`] - 595.533ms
+//! * [`FuturesUnordered`](futures::stream::FuturesUnordered) - 2.814s
 
 #![deny(unused_crate_dependencies)]
 

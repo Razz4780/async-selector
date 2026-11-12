@@ -43,7 +43,7 @@ impl<T> List<T> {
         queue: &Arc<Queue<ListProtected<T>>>,
         value: T,
     ) -> Borrowed<&'a mut T> {
-        let node = queue.create(ListProtected {
+        let node = queue.create_enqueued(ListProtected {
             next: UnsafeCell::new(std::ptr::null()),
             prev: UnsafeCell::new(std::ptr::null()),
             value: UnsafeCell::new(ManuallyDrop::new(value)),
@@ -70,7 +70,8 @@ impl<T> List<T> {
         let borrowed = Borrowed(ManuallyDrop::new(node), PhantomData);
 
         unsafe {
-            queue.enqueue(borrowed.node().clone());
+            // SAFETY: the node was just created from this queue.
+            queue.enqueue_created(borrowed.node());
         }
 
         borrowed
@@ -132,22 +133,15 @@ impl<T> List<T> {
 
     /// Returns an [`AccessGuard`] for the value stored in the given [`Node`].
     ///
-    /// Returns [`None`] if that value was removed.
-    ///
     /// # Safety
     ///
-    /// Caller must ensure that this node either:
-    /// 1. is stored in this list
-    /// 2. was removed from this list
-    pub unsafe fn access<'a>(&'a mut self, node: &Arc<Node<T>>) -> Option<AccessGuard<'a, T>> {
-        let unlinked = unsafe { (*node.value().next.get()).is_null() };
-        if unlinked {
-            return None;
-        }
-        Some(AccessGuard {
+    /// Caller must ensure that this node is stored in this list.
+    pub unsafe fn access<'a>(&'a mut self, node: &Arc<Node<T>>) -> AccessGuard<'a, T> {
+        debug_assert!(unsafe { (*node.value().next.get()).is_null().not() });
+        AccessGuard {
             list: self,
             node: Arc::as_ptr(node),
-        })
+        }
     }
 
     pub fn cursor(&self) -> Cursor<T, &'_ Self> {
@@ -202,10 +196,14 @@ impl<T> List<T> {
             self.front = next;
         }
 
-        Removed(
-            ManuallyDrop::new(unsafe { Arc::from_raw(node) }),
-            PhantomData,
-        )
+        let node = ManuallyDrop::new(unsafe { Arc::from_raw(node) });
+        unsafe {
+            // SAFETY: each node is unlinked exactly once, and the list
+            // is only modified by whoever has unique access to the receiver.
+            node.retire();
+        }
+
+        Removed(node, PhantomData)
     }
 }
 

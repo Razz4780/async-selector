@@ -1,35 +1,40 @@
 //! [`Selector`](super::Selector) visitors.
 
 use crate::{
-    list::{Cursor, List},
+    list::{Cursor, List, ListProtected},
+    queue::Receiver,
     selector::{Borrowed, BorrowedMut, Removed},
 };
 
 /// Returned from [`Selector::into_iter`](super::Selector::into_iter).
-pub struct IntoIter<T>(pub(super) List<T>);
+pub struct IntoIter<T> {
+    /// Must be dropped before the queue (see [`Receiver`]).
+    pub(super) list: List<T>,
+    pub(super) _queue: Receiver<ListProtected<T>>,
+}
 
 impl<T> Iterator for IntoIter<T> {
     type Item = Removed<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.cursor_mut().remove_front().map(Removed)
+        self.list.cursor_mut().remove_front().map(Removed)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.0.len();
+        let len = self.list.len();
         (len, Some(len))
     }
 }
 
 impl<T> ExactSizeIterator for IntoIter<T> {
     fn len(&self) -> usize {
-        self.0.len()
+        self.list.len()
     }
 }
 
 impl<T> DoubleEndedIterator for IntoIter<T> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.0.cursor_mut().remove_back().map(Removed)
+        self.list.cursor_mut().remove_back().map(Removed)
     }
 }
 

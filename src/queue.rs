@@ -6,18 +6,52 @@ use std::{
     task::Waker,
 };
 
-use futures::task::AtomicWaker;
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use loom::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+
+/// [`Node::state`] bit: the node is in the queue (or an enqueue is in progress).
+///
+/// Whoever sets this bit owns the right to enqueue the node.
+/// Only the [`Receiver`] clears it (when the node is dequeued).
+const ENQUEUED: u8 = 0b01;
+/// [`Node::state`] bit: the owner of the node gave it up (see [`Node::retire`]).
+///
+/// Always set together with [`ENQUEUED`], and never cleared.
+/// This means that a retired node can never be enqueued again.
+const RETIRED: u8 = 0b10;
 
 /// Receiver handle for a [`Queue`].
 ///
 /// Since the queue is MPSC, there can be only one instance.
+///
+/// # Ownership of enqueued nodes
+///
+/// The queue stores raw pointers and does **not** own a reference to a node
+/// for as long as the node is owned by somebody else (the "owner", in practice
+/// the [`List`](crate::list::List)).
+/// This saves a reference count round trip on every wakeup.
+///
+/// Before the owner gives the node up, it must call [`Node::retire`].
+/// If the node is enqueued at that point, the queue receives its own reference,
+/// which is released when the node is dequeued (or when the queue is dropped).
+///
+/// The receiver must be dropped only after all nodes created from its queue were retired.
 pub struct Receiver<T> {
     queue: Arc<Queue<T>>,
+    /// Oldest node in the queue. Always points to a valid node.
+    ///
+    /// Lives here (and not in the shared [`Queue`]), because only the receiver uses it.
+    /// This way dequeues do not invalidate the cache line that the senders write to.
+    tail: *const Node<T>,
     stub_predecessor: *const Node<T>,
+    /// Private front of the queue: if not null, this node is dequeued before all others.
+    ///
+    /// Used by [`Receiver::requeue`] when the shared queue is empty.
+    /// Saves the two swaps that it takes to push a node through an empty queue
+    /// (one to enqueue the node, one to enqueue the stub behind it when the node is dequeued).
+    front: *const Node<T>,
 }
 
 impl<T> Receiver<T> {
@@ -25,61 +59,82 @@ impl<T> Receiver<T> {
         &self.queue
     }
 
-    /// Registers the given [`Waker`] and returns a pointer to the last node in the queue.
-    ///
-    /// The [`Waker`] will receive a wakeup when the next node is fully enqueued.
-    ///
-    /// The returned pointer can be used as a snapshot marker.
-    /// If the queue is empty, this method returns [`std::ptr::null`].
-    pub fn register_waker(&mut self, waker: &Waker) -> *const Node<T> {
-        self.queue.waker.register(waker);
+    fn stub(&self) -> *const Node<T> {
+        std::ptr::from_ref(&*self.queue.stub)
+    }
 
+    /// Returns a pointer to the last node in the queue.
+    ///
+    /// The returned pointer can be used as a snapshot marker, it must not be dereferenced.
+    /// If the queue is empty, this method returns [`std::ptr::null`].
+    pub fn marker(&self) -> *const Node<T> {
         let last = self.queue.head.load(Ordering::Acquire);
-        if std::ptr::eq(last, &*self.queue.stub).not() {
+        if std::ptr::eq(last, self.stub()).not() {
             return last;
         }
 
-        let tail = unsafe {
-            // SAFETY: `tail` is only used from the `Receiver`,
-            // and we have a mutable reference.
-            *self.queue.tail.get()
-        };
-        if std::ptr::eq(tail, &*self.queue.stub) {
-            return std::ptr::null();
+        if std::ptr::eq(self.tail, self.stub()) {
+            // Shared queue is empty, `front` is the only node (or null).
+            return self.front;
         }
 
         self.stub_predecessor
+    }
+
+    /// Returns whether the queue may contain a node, or a node may be in the middle of an enqueue.
+    ///
+    /// `false` is a guarantee: there is no node in the queue,
+    /// and every enqueue that started after this check will observe
+    /// a waker registered **before** this check.
+    fn maybe_nonempty(&self) -> bool {
+        self.front.is_null().not()
+            || std::ptr::eq(self.tail, self.stub()).not()
+            || std::ptr::eq(self.queue.head.load(Ordering::SeqCst), self.stub()).not()
+    }
+
+    /// Returns whether the receiver should be polled again right away,
+    /// because there may be nodes ready to be dequeued.
+    pub fn has_pending(&self) -> bool {
+        self.maybe_nonempty()
+    }
+
+    /// Registers the given [`Waker`] to be woken when the next node is enqueued.
+    ///
+    /// Returns `false` if the registration could not be trusted
+    /// (a node was enqueued concurrently, or a wakeup is being delivered right now).
+    /// In this case, the caller should wake the waker on its own.
+    ///
+    /// Only call this when the queue looks empty, this is the slow path.
+    pub fn park(&mut self, waker: &Waker) -> bool {
+        self.queue.waker.register(waker) && self.maybe_nonempty().not()
     }
 
     /// Dequeues the oldest node in the queue.
     ///
     /// Returns [`None`] if the queue is empty or the queue is short and there is an enqueue race.
     pub fn dequeue(&mut self) -> Option<Dequeued<T>> {
-        let mut tail = unsafe {
-            // SAFETY: `tail` is only used from the `Receiver`,
-            // and we have a mutable reference.
-            *self.queue.tail.get()
-        };
+        if self.front.is_null().not() {
+            let front = std::mem::replace(&mut self.front, std::ptr::null());
+            return Some(Dequeued(front));
+        }
+
+        let stub = self.stub();
+        let mut tail = self.tail;
         let mut next = unsafe { &*tail }.next_enqueued.load(Ordering::Acquire);
 
-        if std::ptr::eq(tail, &*self.queue.stub) {
+        if std::ptr::eq(tail, stub) {
             if next.is_null() {
                 return None;
             }
-            unsafe { *self.queue.tail.get() = next };
+            self.tail = next;
             tail = next;
             next = unsafe { &*next }.next_enqueued.load(Ordering::Acquire);
         }
 
         if next.is_null().not() {
-            unsafe { *self.queue.tail.get() = next };
-            debug_assert_ne!(
-                tail,
-                std::ptr::from_ref(&*self.queue.stub),
-                "popping stub, this should never happen",
-            );
-            let node = unsafe { Arc::from_raw(tail) };
-            return Some(Dequeued(node));
+            self.tail = next;
+            debug_assert_ne!(tail, stub, "popping stub, this should never happen");
+            return Some(Dequeued(tail));
         }
 
         if std::ptr::eq(tail, self.queue.head.load(Ordering::Acquire)).not() {
@@ -92,11 +147,10 @@ impl<T> Receiver<T> {
             .stub
             .next_enqueued
             .store(std::ptr::null_mut(), Ordering::Relaxed);
-        let stub = std::ptr::from_ref(&*self.queue.stub).cast_mut();
-        let stub_predecessor = self.queue.head.swap(stub, Ordering::AcqRel);
+        let stub_predecessor = self.queue.head.swap(stub.cast_mut(), Ordering::SeqCst);
         unsafe { &*stub_predecessor }
             .next_enqueued
-            .store(stub, Ordering::Release);
+            .store(stub.cast_mut(), Ordering::Release);
         self.stub_predecessor = stub_predecessor;
 
         next = unsafe { &*tail }.next_enqueued.load(Ordering::Acquire);
@@ -104,14 +158,36 @@ impl<T> Receiver<T> {
             // Enqueue is in progress.
             None
         } else {
-            unsafe { *self.queue.tail.get() = next };
-            debug_assert_ne!(
-                tail,
-                std::ptr::from_ref(&*self.queue.stub),
-                "popping stub, this should never happen",
-            );
-            let node = unsafe { Arc::from_raw(tail) };
-            Some(Dequeued(node))
+            self.tail = next;
+            debug_assert_ne!(tail, stub, "popping stub, this should never happen");
+            Some(Dequeued(tail))
+        }
+    }
+
+    /// Enqueues the given [`Node`] again, unless it is already in the queue.
+    ///
+    /// Meant to be called by the receiver itself,
+    /// so it skips everything that only matters to a foreign sender:
+    /// it does not need to check whether the queue is still alive,
+    /// and it does not wake the receiver.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that the [`Node`] belongs to this queue instance and was not retired.
+    pub unsafe fn requeue(&mut self, node: &Arc<Node<T>>) {
+        if node.state.fetch_or(ENQUEUED, Ordering::AcqRel) & ENQUEUED != 0 {
+            return;
+        }
+        // If the queue is empty, the node would be the first one to be dequeued anyway.
+        // (A sender may be racing with this check. In this case its node ends up behind ours,
+        // which is one of the orders that could have happened without this shortcut.)
+        if self.front.is_null()
+            && std::ptr::eq(self.tail, self.stub())
+            && std::ptr::eq(self.queue.head.load(Ordering::Acquire), self.stub())
+        {
+            self.front = Arc::as_ptr(node);
+        } else {
+            unsafe { self.queue.enqueue_inner(Arc::as_ptr(node)) };
         }
     }
 }
@@ -119,12 +195,14 @@ impl<T> Receiver<T> {
 impl<T> Default for Receiver<T> {
     fn default() -> Self {
         let queue = Arc::new(Queue {
-            waker: Default::default(),
             head: Default::default(),
-            tail: UnsafeCell::new(std::ptr::null()),
+            waker: Default::default(),
+            tail_on_drop: UnsafeCell::new(std::ptr::null()),
+            #[cfg(loom)]
+            arc_sync: loom::sync::atomic::AtomicUsize::new(0),
             stub: ManuallyDrop::new(Node {
                 queue: Weak::new(),
-                is_enqueued: Default::default(),
+                state: AtomicU8::new(0),
                 next_enqueued: Default::default(),
                 value: MaybeUninit::uninit(),
             }),
@@ -132,14 +210,37 @@ impl<T> Default for Receiver<T> {
 
         let stub_ptr = std::ptr::from_ref(&*queue.stub).cast_mut();
         queue.head.store(stub_ptr, Ordering::Release);
-        unsafe {
-            *queue.tail.get() = stub_ptr;
-        }
 
         Self {
             queue,
+            tail: stub_ptr,
             stub_predecessor: std::ptr::null(),
+            front: std::ptr::null(),
         }
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        if self.front.is_null().not() {
+            // Same rule as for the nodes in the shared queue:
+            // all nodes are retired by now, and we own a reference to this one.
+            debug_assert!(
+                unsafe { &*self.front }.state.load(Ordering::Relaxed) & RETIRED != 0,
+                "receiver dropped before a node was retired",
+            );
+            let _ = unsafe { Arc::from_raw(self.front) };
+        }
+
+        // Hand the tail over, the queue needs it to release the remaining nodes.
+        // The queue may be dropped later than the receiver,
+        // if some sender is in the middle of an enqueue.
+        unsafe {
+            // SAFETY: only the receiver and `Queue::drop` access this field.
+            *self.queue.tail_on_drop.get() = self.tail;
+        }
+        #[cfg(loom)]
+        self.queue.arc_sync.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -149,11 +250,18 @@ unsafe impl<T: Send> Sync for Receiver<T> {}
 
 /// Vyukov-style intrusive MPSC queue.
 pub struct Queue<T> {
-    waker: AtomicWaker,
     /// Always points to a valid node.
     head: AtomicPtr<Node<T>>,
-    /// Always points to a valid node.
-    tail: UnsafeCell<*const Node<T>>,
+    /// Waker of the receiver, if the receiver is parked.
+    waker: WakerSlot,
+    /// Set when the [`Receiver`] is dropped.
+    tail_on_drop: UnsafeCell<*const Node<T>>,
+    /// Loom does not see the synchronization provided by the reference count of [`Arc`]
+    /// (it is not a Loom type): everything done by a thread that released
+    /// its reference happens-before [`Queue::drop`].
+    /// This field replays the reference count operations for Loom.
+    #[cfg(loom)]
+    arc_sync: loom::sync::atomic::AtomicUsize,
     /// Used to ensure that the queue always has at least one node.
     stub: ManuallyDrop<Node<T>>,
 }
@@ -161,51 +269,87 @@ pub struct Queue<T> {
 impl<T> Queue<T> {
     /// Creates a new [`Node`] bound to this queue.
     ///
-    /// The node is not enqueued.
-    pub fn create(self: &Arc<Self>, value: T) -> Arc<Node<T>> {
+    /// The node is marked as enqueued, but it is **not** in the queue yet.
+    /// The caller is expected to follow up with [`Queue::enqueue_created`].
+    pub fn create_enqueued(self: &Arc<Self>, value: T) -> Arc<Node<T>> {
         Arc::new(Node {
             queue: Arc::downgrade(self),
-            is_enqueued: AtomicBool::new(false),
+            state: AtomicU8::new(ENQUEUED),
             next_enqueued: Default::default(),
             value: MaybeUninit::new(value),
         })
     }
 
+    /// Creates a new [`Node`] bound to this queue.
+    ///
+    /// The node is not enqueued.
+    #[cfg(test)]
+    pub fn create(self: &Arc<Self>, value: T) -> Arc<Node<T>> {
+        let node = self.create_enqueued(value);
+        node.state.store(0, Ordering::Release);
+        node
+    }
+
+    /// Enqueues a [`Node`] obtained from [`Queue::create_enqueued`].
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that the [`Node`]:
+    /// 1. was created with [`Queue::create_enqueued`] called on this queue instance
+    /// 2. was not passed to this function before
+    pub unsafe fn enqueue_created(&self, node: &Arc<Node<T>>) {
+        unsafe { self.enqueue_inner(Arc::as_ptr(node)) };
+        self.waker.notify();
+    }
+
+    /// Wakes the receiver, if it is parked.
+    pub fn notify(&self) {
+        self.waker.notify();
+    }
+
     /// Enqueues the given [`Node`], unless it is already in the queue.
+    ///
+    /// Does not wake the receiver, see [`Queue::notify`].
     ///
     /// # Safety
     ///
     /// Caller must ensure that the [`Node`] belongs to this queue instance.
-    pub unsafe fn enqueue(self: &Arc<Self>, node: Arc<Node<T>>) {
-        if node.is_enqueued.swap(true, Ordering::AcqRel) {
+    pub unsafe fn enqueue_silent(&self, node: &Arc<Node<T>>) {
+        if node.state.fetch_or(ENQUEUED, Ordering::AcqRel) & ENQUEUED != 0 {
             return;
         }
-        unsafe { self.enqueue_inner(node) };
+        unsafe { self.enqueue_inner(Arc::as_ptr(node)) };
     }
 
-    /// Enqueues the given [`Node`].
+    /// Links the given [`Node`] into the queue.
     ///
     /// # Safety
     ///
     /// Caller must ensure that the [`Node`]:
     /// 1. belongs to this queue instance
-    /// 2. [`Node::is_enqueued`] lock was acquired
-    unsafe fn enqueue_inner(self: &Arc<Self>, node: Arc<Node<T>>) {
-        debug_assert!(node.is_enqueued.load(Ordering::Relaxed));
-        debug_assert_eq!(Arc::as_ptr(self), Weak::as_ptr(node.queue()));
-
-        node.next_enqueued
-            .store(std::ptr::null_mut(), Ordering::Relaxed);
-        let node = Arc::into_raw(node).cast_mut();
-        let head = self.head.swap(node, Ordering::AcqRel);
+    /// 2. has the [`ENQUEUED`] bit set, and the caller is the one who set it
+    unsafe fn enqueue_inner(&self, node: *const Node<T>) {
+        let node = node.cast_mut();
+        unsafe {
+            debug_assert!((*node).state.load(Ordering::Relaxed) & ENQUEUED != 0);
+            debug_assert_eq!(std::ptr::from_ref(self), Weak::as_ptr(&(*node).queue));
+            (*node)
+                .next_enqueued
+                .store(std::ptr::null_mut(), Ordering::Relaxed);
+        }
+        // `SeqCst` is required here. See `WakerSlot`.
+        let head = self.head.swap(node, Ordering::SeqCst);
+        // SAFETY: the previous head cannot leave the queue before its `next_enqueued` is set.
         let head = unsafe { &*head };
         head.next_enqueued.store(node, Ordering::Release);
-        self.waker.wake();
     }
 }
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
+        #[cfg(loom)]
+        self.arc_sync.fetch_add(1, Ordering::AcqRel);
+
         struct Guard<T> {
             stub: *const Node<T>,
             tail: *const Node<T>,
@@ -235,6 +379,12 @@ impl<T> Drop for Queue<T> {
                     let to_drop = inner.tail;
                     inner.tail = next;
 
+                    // The receiver is gone, so all nodes were retired.
+                    // Retired nodes found in the queue are owned by the queue.
+                    debug_assert!(
+                        unsafe { &*to_drop }.state.load(Ordering::Relaxed) & RETIRED != 0,
+                        "receiver dropped before a node was retired",
+                    );
                     let _ = unsafe { Arc::from_raw(to_drop) };
                 }
 
@@ -244,7 +394,7 @@ impl<T> Drop for Queue<T> {
 
         drop(Guard {
             stub: std::ptr::from_ref(&*self.stub),
-            tail: *self.tail.get_mut(),
+            tail: *self.tail_on_drop.get_mut(),
         });
 
         unsafe {
@@ -263,7 +413,8 @@ unsafe impl<T: Send> Sync for Queue<T> {}
 /// Always belongs to a single [`Queue`].
 pub struct Node<T> {
     queue: Weak<Queue<T>>,
-    is_enqueued: AtomicBool,
+    /// Combination of [`ENQUEUED`] and [`RETIRED`].
+    state: AtomicU8,
     next_enqueued: AtomicPtr<Self>,
     /// Always initialized, except for the [`Queue::stub`] node.
     value: MaybeUninit<T>,
@@ -279,28 +430,69 @@ impl<T> Node<T> {
     ///
     /// If the node is already in the queue, does nothing.
     pub fn enqueue(self: Arc<Self>) {
-        if self.is_enqueued.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Some(queue) = self.queue.upgrade() {
-            unsafe { queue.enqueue_inner(self) };
-        }
+        self.enqueue_by_ref();
     }
 
     /// Enqueues this node into its parent queue.
     ///
     /// If the node is already in the queue, does nothing.
     pub fn enqueue_by_ref(self: &Arc<Self>) {
-        if self.is_enqueued.swap(true, Ordering::AcqRel) {
+        if self.state.fetch_or(ENQUEUED, Ordering::AcqRel) & ENQUEUED != 0 {
             return;
         }
-        if let Some(queue) = self.queue.upgrade() {
-            unsafe { queue.enqueue_inner(self.clone()) };
+        // Loom only switches threads on operations it knows about, and `Weak::upgrade`
+        // is not one of them. Without this load, Loom would never run
+        // the receiver between the `fetch_or` above and the upgrade below.
+        #[cfg(loom)]
+        let _ = self.state.load(Ordering::Relaxed);
+        match self.queue.upgrade() {
+            Some(queue) => {
+                unsafe { queue.enqueue_inner(Arc::as_ptr(self)) };
+                queue.waker.notify();
+                #[cfg(loom)]
+                queue.arc_sync.fetch_add(1, Ordering::AcqRel);
+            }
+            None => {
+                // The receiver is gone, so this node was retired,
+                // and that happened after we set the `ENQUEUED` bit
+                // (otherwise we would have seen the bit set by `Node::retire`).
+                // The queue was given a reference to this node,
+                // but the node will never make it into the queue.
+                // Release that reference here.
+                //
+                // The order of this decrement and the increment in `Node::retire`
+                // does not matter: we hold our own reference to the node.
+                unsafe { Arc::decrement_strong_count(Arc::as_ptr(self)) };
+            }
+        }
+    }
+
+    /// Marks this node as given up by its owner.
+    ///
+    /// After this call, the node will never be enqueued again.
+    /// If the node is in the queue right now, the queue receives its own reference to the node.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that:
+    /// 1. this method is called at most once for each node
+    /// 2. this call is synchronized with all uses of the [`Receiver`]
+    ///    (in practice: the caller has unique access to the receiver's owner)
+    pub unsafe fn retire(self: &Arc<Self>) {
+        let prev = self.state.fetch_or(ENQUEUED | RETIRED, Ordering::AcqRel);
+        debug_assert!(prev & RETIRED == 0, "node retired twice");
+        if prev & ENQUEUED != 0 {
+            std::mem::forget(self.clone());
         }
     }
 
     pub fn value(&self) -> &T {
         unsafe { self.value.assume_init_ref() }
+    }
+
+    #[cfg(test)]
+    fn is_enqueued(&self) -> bool {
+        self.state.load(Ordering::Acquire) & ENQUEUED != 0
     }
 
     /// Drops all fields of the node, ignoring [`Self::value`].
@@ -310,13 +502,13 @@ impl<T> Node<T> {
         let mut this = ManuallyDrop::new(self);
         let Self {
             queue,
-            is_enqueued,
+            state,
             next_enqueued,
             value: _value,
         } = &mut *this;
         unsafe {
             std::ptr::drop_in_place(queue);
-            std::ptr::drop_in_place(is_enqueued);
+            std::ptr::drop_in_place(state);
             std::ptr::drop_in_place(next_enqueued);
         }
     }
@@ -332,19 +524,148 @@ impl<T> Drop for Node<T> {
 
 /// [`Node`] dequeued from a [`Receiver`].
 ///
-/// Until the [`Node`] is recovered with [`Dequeued::into_inner`],
+/// Until the [`Node`] is recovered with [`Dequeued::into_live`],
 /// it cannot be enqueued again.
-pub struct Dequeued<T>(Arc<Node<T>>);
+pub struct Dequeued<T>(*const Node<T>);
 
 impl<T> Dequeued<T> {
-    pub fn get(&self) -> &Arc<Node<T>> {
-        &self.0
+    pub fn as_ptr(&self) -> *const Node<T> {
+        self.0
     }
 
     /// Recovers the [`Node`], marking it as enqueueable.
-    pub fn into_inner(self) -> Arc<Node<T>> {
-        self.0.is_enqueued.store(false, Ordering::Release);
-        self.0
+    ///
+    /// Returns [`None`] if the node was retired.
+    /// In this case, the reference owned by the queue is released.
+    ///
+    /// The returned handle does not own a reference to the node.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that the owner of the node keeps it alive
+    /// for as long as the returned handle is used (unless the node is retired first).
+    pub unsafe fn into_live(self) -> Option<ManuallyDrop<Arc<Node<T>>>> {
+        let node = unsafe { Arc::from_raw(self.0) };
+        // `RETIRED` is only set under the synchronization required by `Node::retire`.
+        if node.state.load(Ordering::Relaxed) & RETIRED != 0 {
+            drop(node);
+            return None;
+        }
+        // Senders can only set `ENQUEUED`, which is already set.
+        node.state.store(0, Ordering::Release);
+        Some(ManuallyDrop::new(node))
+    }
+}
+
+const EMPTY: u8 = 0;
+const ARMED: u8 = 1;
+const BUSY: u8 = 2;
+
+/// Slot for the receiver's [`Waker`].
+///
+/// Tailored replacement for `futures::task::AtomicWaker`.
+/// The difference is that [`WakerSlot::notify`] costs a single atomic load
+/// when no waker is registered, which is the common case:
+/// the receiver only registers its waker right before it goes to sleep.
+///
+/// # Lost wakeups
+///
+/// The receiver does: [`WakerSlot::register`] (store), then checks [`Queue::head`] (load).
+/// The sender does: swap [`Queue::head`] (store), then [`WakerSlot::notify`] (load).
+/// All four use [`Ordering::SeqCst`], so at least one side sees the other's store:
+/// either the receiver sees the new head, or the sender sees the registered waker.
+///
+/// Loom treats `SeqCst` accesses as `AcqRel` (a documented limitation),
+/// which makes it report a lost wakeup here. It does model `fence(SeqCst)`,
+/// so under `cfg(loom)` a fence is put between the store and the load on both sides.
+struct WakerSlot {
+    /// * [`EMPTY`] - no waker is registered, only the receiver may access `waker`
+    /// * [`ARMED`] - waker is registered, nobody may access `waker`
+    /// * [`BUSY`] - whoever moved the state from [`ARMED`] may access `waker`
+    state: AtomicU8,
+    waker: UnsafeCell<Option<Waker>>,
+}
+
+impl WakerSlot {
+    /// Registers the waker. Must only be called by the receiver.
+    ///
+    /// Returns `false` if a concurrent [`WakerSlot::notify`] got in the way.
+    /// In this case, the waker might not be registered.
+    fn register(&self, waker: &Waker) -> bool {
+        match self.state.load(Ordering::Acquire) {
+            EMPTY => {
+                unsafe {
+                    // SAFETY: state is `EMPTY`, and we are the receiver.
+                    *self.waker.get() = Some(waker.clone());
+                }
+                self.state.store(ARMED, Ordering::SeqCst);
+                #[cfg(loom)]
+                loom::sync::atomic::fence(Ordering::SeqCst);
+                true
+            }
+            ARMED => {
+                if self
+                    .state
+                    .compare_exchange(ARMED, BUSY, Ordering::SeqCst, Ordering::Acquire)
+                    .is_err()
+                {
+                    return false;
+                }
+                // If the assignment panics, the slot stays `BUSY` forever,
+                // and the receiver degrades to busy polling. This is still correct.
+                unsafe {
+                    // SAFETY: we moved the state from `ARMED` to `BUSY`.
+                    let slot = &mut *self.waker.get();
+                    match slot {
+                        Some(old) if old.will_wake(waker) => {}
+                        _ => *slot = Some(waker.clone()),
+                    }
+                }
+                self.state.store(ARMED, Ordering::SeqCst);
+                #[cfg(loom)]
+                loom::sync::atomic::fence(Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Wakes the registered waker, if there is one.
+    fn notify(&self) {
+        #[cfg(loom)]
+        loom::sync::atomic::fence(Ordering::SeqCst);
+        if self.state.load(Ordering::SeqCst) != ARMED {
+            return;
+        }
+        self.notify_slow();
+    }
+
+    #[cold]
+    fn notify_slow(&self) {
+        if self
+            .state
+            .compare_exchange(ARMED, BUSY, Ordering::SeqCst, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let waker = unsafe {
+            // SAFETY: we moved the state from `ARMED` to `BUSY`.
+            (*self.waker.get()).take()
+        };
+        self.state.store(EMPTY, Ordering::Release);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl Default for WakerSlot {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(EMPTY),
+            waker: UnsafeCell::new(None),
+        }
     }
 }
 
@@ -352,8 +673,8 @@ impl<T> Dequeued<T> {
 mod test {
     use std::{
         panic::AssertUnwindSafe,
-        sync::{Arc, Barrier, atomic::Ordering},
-        task::{Poll, Waker},
+        sync::{Arc, Barrier},
+        task::{Poll, Wake, Waker},
     };
     use tokio::sync::Barrier as TokioBarrier;
 
@@ -368,8 +689,14 @@ mod test {
             let first = queue.create(1);
             let second = queue.create(2);
 
-            let first_sender = loom::thread::spawn(move || first.enqueue());
-            let second_sender = loom::thread::spawn(move || second.enqueue());
+            let first_sender = {
+                let first = first.clone();
+                loom::thread::spawn(move || first.enqueue())
+            };
+            let second_sender = {
+                let second = second.clone();
+                loom::thread::spawn(move || second.enqueue())
+            };
 
             let mut values = Vec::new();
             while values.len() < 2 {
@@ -377,7 +704,7 @@ mod test {
                     loom::thread::yield_now();
                     continue;
                 };
-                values.push(*node.get().value());
+                values.push(*unsafe { node.into_live() }.unwrap().value());
             }
 
             first_sender.join().unwrap();
@@ -387,6 +714,78 @@ mod test {
 
             values.sort_unstable();
             assert_eq!(values, [1, 2]);
+
+            unsafe {
+                first.retire();
+                second.retire();
+            }
+        });
+    }
+
+    /// The receiver goes to sleep while a sender enqueues a node.
+    /// Either the receiver sees the node, or the sender wakes the receiver.
+    #[cfg(loom)]
+    #[test]
+    fn loom_no_lost_wakeup() {
+        use loom::sync::atomic::{AtomicBool, Ordering};
+
+        struct Flag(AtomicBool);
+
+        impl Wake for Flag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        loom::model(|| {
+            let mut receiver = Receiver::default();
+            let node = receiver.queue().create(());
+            let flag = Arc::new(Flag(AtomicBool::new(false)));
+            let waker = Waker::from(flag.clone());
+
+            let sender = {
+                let node = node.clone();
+                loom::thread::spawn(move || node.enqueue())
+            };
+
+            let dequeued = match receiver.dequeue() {
+                Some(dequeued) => dequeued,
+                None => {
+                    let parked = receiver.park(&waker);
+                    sender.join().unwrap();
+                    if parked {
+                        assert!(flag.0.load(Ordering::SeqCst), "lost wakeup");
+                    }
+                    receiver.dequeue().expect("node should be in the queue")
+                }
+            };
+            assert!(unsafe { dequeued.into_live() }.is_some());
+
+            unsafe { node.retire() };
+        });
+    }
+
+    /// The owner retires the node and drops the receiver while a sender enqueues the node.
+    /// The node must be freed, no matter who wins.
+    #[cfg(loom)]
+    #[test]
+    fn loom_retire_races_with_enqueue() {
+        loom::model(|| {
+            let receiver = Receiver::default();
+            let node = receiver.queue().create(());
+            let weak = Arc::downgrade(&node);
+
+            let sender = {
+                let node = node.clone();
+                loom::thread::spawn(move || node.enqueue())
+            };
+
+            unsafe { node.retire() };
+            drop(node);
+            drop(receiver);
+            sender.join().unwrap();
+
+            assert!(weak.upgrade().is_none(), "node leaked");
         });
     }
 
@@ -397,15 +796,17 @@ mod test {
 
         let mut queue = Receiver::<usize>::default();
         let barrier = Arc::new(TokioBarrier::new(SENDERS + 1));
+        let nodes = (0..SENDERS)
+            .map(|i| queue.queue().create(i))
+            .collect::<Vec<_>>();
 
-        for i in 0..SENDERS {
-            let queue = queue.queue().clone();
+        for node in &nodes {
+            let node = node.clone();
             let barrier = barrier.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
-                let node = queue.create(i);
                 for _ in 0..ITERATIONS {
-                    while node.is_enqueued.load(Ordering::Acquire) {
+                    while node.is_enqueued() {
                         std::hint::spin_loop();
                     }
                     node.enqueue_by_ref();
@@ -419,16 +820,20 @@ mod test {
 
         while remaining > 0 {
             futures::future::poll_fn(|cx| {
-                let marker = queue.register_waker(cx.waker());
+                let marker = queue.marker();
                 if marker.is_null() {
-                    return Poll::Pending;
+                    if queue.park(cx.waker()) {
+                        return Poll::Pending;
+                    }
+                    cx.waker().wake_by_ref();
+                    return Poll::Ready(());
                 }
 
                 while let Some(node) = queue.dequeue() {
-                    let is_last = Arc::as_ptr(node.get()) == marker;
+                    let is_last = node.as_ptr() == marker;
                     remaining -= 1;
-                    counts[*node.get().value()] += 1;
-                    node.into_inner();
+                    let node = unsafe { node.into_live() }.unwrap();
+                    counts[*node.value()] += 1;
                     if is_last {
                         return Poll::Ready(());
                     }
@@ -442,6 +847,9 @@ mod test {
         for count in counts {
             assert_eq!(count, ITERATIONS);
         }
+        for node in &nodes {
+            unsafe { node.retire() };
+        }
     }
 
     #[test]
@@ -451,21 +859,26 @@ mod test {
 
         let mut queue = Receiver::<usize>::default();
         let barrier = Arc::new(Barrier::new(SENDERS + 1));
+        let nodes = (0..SENDERS)
+            .map(|i| queue.queue().create(i))
+            .collect::<Vec<_>>();
 
-        for i in 0..SENDERS {
-            let queue = queue.queue().clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                let node = queue.create(i);
-                for _ in 0..ITERATIONS {
-                    while node.is_enqueued.load(Ordering::Acquire) {
-                        std::hint::spin_loop();
+        let handles = nodes
+            .iter()
+            .cloned()
+            .map(|node| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ITERATIONS {
+                        while node.is_enqueued() {
+                            std::hint::spin_loop();
+                        }
+                        node.enqueue_by_ref();
                     }
-                    node.enqueue_by_ref();
-                }
-            });
-        }
+                })
+            })
+            .collect::<Vec<_>>();
 
         let mut counts = [0; SENDERS];
         let mut remaining = SENDERS * ITERATIONS;
@@ -474,7 +887,7 @@ mod test {
         while remaining > 0 {
             let node = loop {
                 if let Some(node) = queue.dequeue() {
-                    break node.into_inner();
+                    break unsafe { node.into_live() }.unwrap();
                 } else {
                     std::hint::spin_loop();
                 }
@@ -483,12 +896,146 @@ mod test {
             counts[*node.value()] += 1;
         }
 
+        for handle in handles {
+            handle.join().unwrap();
+        }
         for _ in 0..100 {
             assert!(queue.dequeue().is_none());
         }
         for count in counts {
             assert_eq!(count, ITERATIONS);
         }
+        for node in &nodes {
+            unsafe { node.retire() };
+        }
+    }
+
+    #[test]
+    fn parked_receiver_is_woken_once() {
+        struct Counter(std::sync::atomic::AtomicUsize);
+
+        impl Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(Counter(Default::default()));
+        let waker = Waker::from(counter.clone());
+        let wakeups = || counter.0.load(std::sync::atomic::Ordering::SeqCst);
+
+        let mut queue = Receiver::<()>::default();
+        let first = queue.queue().create(());
+        let second = queue.queue().create(());
+
+        // Nobody is parked.
+        first.enqueue_by_ref();
+        assert_eq!(wakeups(), 0);
+        assert!(queue.has_pending());
+        // Queue is not empty, parking must be refused.
+        assert!(!queue.park(&waker));
+        assert!(unsafe { queue.dequeue().unwrap().into_live() }.is_some());
+        // The refused park left the waker behind, which is fine.
+        second.enqueue_by_ref();
+        assert_eq!(wakeups(), 1);
+        assert!(unsafe { queue.dequeue().unwrap().into_live() }.is_some());
+
+        assert!(!queue.has_pending());
+        assert!(queue.park(&waker));
+        assert!(queue.park(&waker));
+        first.enqueue_by_ref();
+        assert_eq!(wakeups(), 2);
+        second.enqueue_by_ref();
+        assert_eq!(wakeups(), 2);
+
+        unsafe {
+            first.retire();
+            second.retire();
+        }
+        drop(queue);
+        assert_eq!(Arc::strong_count(&first), 1);
+        assert_eq!(Arc::strong_count(&second), 1);
+        assert_eq!(Arc::strong_count(&counter), 2);
+    }
+
+    #[test]
+    fn retired_node_is_never_enqueued_again() {
+        let mut queue = Receiver::<()>::default();
+
+        // Retired while idle.
+        let node = queue.queue().create(());
+        unsafe { node.retire() };
+        node.enqueue_by_ref();
+        assert!(queue.dequeue().is_none());
+        assert_eq!(Arc::strong_count(&node), 1);
+
+        // Retired while enqueued.
+        let node = queue.queue().create(());
+        node.enqueue_by_ref();
+        assert_eq!(Arc::strong_count(&node), 1);
+        unsafe { node.retire() };
+        assert_eq!(Arc::strong_count(&node), 2);
+        assert!(unsafe { queue.dequeue().unwrap().into_live() }.is_none());
+        assert_eq!(Arc::strong_count(&node), 1);
+        node.enqueue_by_ref();
+        assert!(queue.dequeue().is_none());
+
+        // Retired, and then the receiver is dropped during an "enqueue".
+        let node = queue.queue().create(());
+        let weak = Arc::downgrade(&node);
+        unsafe { node.retire() };
+        drop(queue);
+        node.enqueue();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn requeue_keeps_fifo_order() {
+        let mut queue = Receiver::<usize>::default();
+        let nodes = (0..3).map(|i| queue.queue().create(i)).collect::<Vec<_>>();
+        let pop = |queue: &mut Receiver<usize>| {
+            let node = unsafe { queue.dequeue()?.into_live() }.unwrap();
+            Some(*node.value())
+        };
+
+        // Empty queue: the node goes to the private slot.
+        unsafe { queue.requeue(&nodes[0]) };
+        assert!(queue.has_pending());
+        assert_eq!(queue.marker(), Arc::as_ptr(&nodes[0]));
+        // Requeue of an enqueued node is a no-op, and so is a wakeup.
+        unsafe { queue.requeue(&nodes[0]) };
+        nodes[0].enqueue_by_ref();
+        // Nodes enqueued later come out later.
+        nodes[1].enqueue_by_ref();
+        assert_eq!(queue.marker(), Arc::as_ptr(&nodes[1]));
+        unsafe { queue.requeue(&nodes[2]) };
+        assert_eq!(queue.marker(), Arc::as_ptr(&nodes[2]));
+        assert_eq!(pop(&mut queue), Some(0));
+        assert_eq!(pop(&mut queue), Some(1));
+        assert_eq!(pop(&mut queue), Some(2));
+        assert_eq!(pop(&mut queue), None);
+        assert!(queue.marker().is_null());
+        assert!(!queue.has_pending());
+
+        // Node retired while it sits in the private slot is released on dequeue...
+        unsafe {
+            queue.requeue(&nodes[0]);
+            nodes[0].retire();
+        }
+        assert_eq!(Arc::strong_count(&nodes[0]), 2);
+        assert!(unsafe { queue.dequeue().unwrap().into_live() }.is_none());
+        assert_eq!(Arc::strong_count(&nodes[0]), 1);
+        assert!(queue.dequeue().is_none());
+
+        // ...or when the receiver is dropped.
+        unsafe {
+            queue.requeue(&nodes[1]);
+            nodes[1].retire();
+            nodes[2].retire();
+        }
+        assert_eq!(Arc::strong_count(&nodes[1]), 2);
+        drop(queue);
+        assert_eq!(Arc::strong_count(&nodes[1]), 1);
     }
 
     #[test]
@@ -498,7 +1045,8 @@ mod test {
             .take(10)
             .map(|strong| {
                 let weak = Arc::downgrade(&strong);
-                strong.enqueue();
+                strong.enqueue_by_ref();
+                unsafe { strong.retire() };
                 weak
             })
             .collect::<Vec<_>>();
@@ -527,7 +1075,8 @@ mod test {
             .map(|should_panic| queue.queue().create(Node(should_panic)))
             .map(|strong| {
                 let weak = Arc::downgrade(&strong);
-                strong.enqueue();
+                strong.enqueue_by_ref();
+                unsafe { strong.retire() };
                 weak
             })
             .collect::<Vec<_>>();
@@ -542,14 +1091,18 @@ mod test {
     #[test]
     fn queue_returns_correct_tail_marker() {
         let mut queue = Receiver::<()>::default();
-        assert!(queue.register_waker(Waker::noop()).is_null());
+        assert!(queue.marker().is_null());
         let node = queue.queue().create(());
         node.enqueue_by_ref();
-        assert_eq!(queue.register_waker(Waker::noop()), Arc::as_ptr(&node));
-        let _ = queue.dequeue().unwrap();
-        assert!(queue.register_waker(Waker::noop()).is_null());
+        assert_eq!(queue.marker(), Arc::as_ptr(&node));
+        assert!(unsafe { queue.dequeue().unwrap().into_live() }.is_some());
+        assert!(queue.marker().is_null());
         let node_1 = queue.queue().create(());
         node_1.enqueue_by_ref();
-        assert_eq!(queue.register_waker(Waker::noop()), Arc::as_ptr(&node_1));
+        assert_eq!(queue.marker(), Arc::as_ptr(&node_1));
+        unsafe {
+            node.retire();
+            node_1.retire();
+        }
     }
 }

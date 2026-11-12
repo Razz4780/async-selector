@@ -86,17 +86,19 @@ mod test {
         drop(cloned);
         assert_eq!(Arc::strong_count(&node), 1);
 
+        // The queue does not own a reference to an enqueued node.
         waker.wake_by_ref();
-        assert_eq!(Arc::strong_count(&node), 2);
-        queue.dequeue().unwrap().into_inner();
         assert_eq!(Arc::strong_count(&node), 1);
+        assert!(unsafe { queue.dequeue().unwrap().into_live() }.is_some());
+        assert!(queue.dequeue().is_none());
 
         waker.clone().wake();
-        assert_eq!(Arc::strong_count(&node), 2);
-        queue.dequeue().unwrap().into_inner();
         assert_eq!(Arc::strong_count(&node), 1);
+        assert!(unsafe { queue.dequeue().unwrap().into_live() }.is_some());
+        assert!(queue.dequeue().is_none());
 
         drop(waker);
         assert_eq!(Arc::strong_count(&node), 1);
+        unsafe { node.retire() };
     }
 }

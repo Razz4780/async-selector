@@ -178,6 +178,27 @@ impl<T> List<T> {
         }
     }
 
+    /// Removes (and drops) all values.
+    ///
+    /// If dropping a value panics, the remaining values are still removed.
+    pub fn clear(&mut self) {
+        struct Guard<'a, T>(&'a mut List<T>);
+
+        impl<T> Drop for Guard<'_, T> {
+            fn drop(&mut self) {
+                let inner = Guard(self.0);
+
+                while inner.0.front.is_null().not() {
+                    unsafe { inner.0.remove_unchecked(inner.0.front) };
+                }
+
+                let _ = ManuallyDrop::new(inner);
+            }
+        }
+
+        drop(Guard(self));
+    }
+
     unsafe fn remove_unchecked(&mut self, node: *const Node<T>) -> Removed<T> {
         let prev = unsafe { *(&*node).value().prev.get() };
         let next = unsafe { *(&*node).value().next.get() };
@@ -218,21 +239,7 @@ impl<T> Default for List<T> {
 
 impl<T> Drop for List<T> {
     fn drop(&mut self) {
-        struct Guard<'a, T>(&'a mut List<T>);
-
-        impl<T> Drop for Guard<'_, T> {
-            fn drop(&mut self) {
-                let inner = Guard(self.0);
-
-                while inner.0.front.is_null().not() {
-                    unsafe { inner.0.remove_unchecked(inner.0.front) };
-                }
-
-                let _ = ManuallyDrop::new(inner);
-            }
-        }
-
-        drop(Guard(self));
+        self.clear();
     }
 }
 

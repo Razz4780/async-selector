@@ -82,20 +82,16 @@ impl<T> Receiver<T> {
     }
 
     /// Returns whether the queue may contain a node, or a node may be in the middle of an enqueue.
+    /// If so, the receiver should be polled again right away.
     ///
     /// `false` is a guarantee: there is no node in the queue,
     /// and every enqueue that started after this check will observe
-    /// a waker registered **before** this check.
-    fn maybe_nonempty(&self) -> bool {
+    /// a waker registered **before** this check ([`Receiver::park`] relies on this:
+    /// it calls this method again after it registers the waker).
+    pub fn has_pending(&self) -> bool {
         self.front.is_null().not()
             || std::ptr::eq(self.tail, self.stub()).not()
             || std::ptr::eq(self.queue.head.load(Ordering::SeqCst), self.stub()).not()
-    }
-
-    /// Returns whether the receiver should be polled again right away,
-    /// because there may be nodes ready to be dequeued.
-    pub fn has_pending(&self) -> bool {
-        self.maybe_nonempty()
     }
 
     /// Registers the given [`Waker`] to be woken when the next node is enqueued.
@@ -106,7 +102,16 @@ impl<T> Receiver<T> {
     ///
     /// Only call this when the queue looks empty, this is the slow path.
     pub fn park(&mut self, waker: &Waker) -> bool {
-        self.queue.waker.register(waker) && self.maybe_nonempty().not()
+        if self.queue.waker.register(waker).not() {
+            return false;
+        }
+        if self.has_pending() {
+            // The caller is going to wake the waker on its own.
+            // Take it back, so that the next enqueue does not wake it for the second time.
+            self.queue.waker.disarm();
+            return false;
+        }
+        true
     }
 
     /// Dequeues the oldest node in the queue.
@@ -526,6 +531,7 @@ impl<T> Drop for Node<T> {
 ///
 /// Until the [`Node`] is recovered with [`Dequeued::into_live`],
 /// it cannot be enqueued again.
+#[must_use = "a dequeued node must be recovered with `into_live`"]
 pub struct Dequeued<T>(*const Node<T>);
 
 impl<T> Dequeued<T> {
@@ -546,13 +552,26 @@ impl<T> Dequeued<T> {
     /// for as long as the returned handle is used (unless the node is retired first).
     pub unsafe fn into_live(self) -> Option<ManuallyDrop<Arc<Node<T>>>> {
         let node = unsafe { Arc::from_raw(self.0) };
-        // `RETIRED` is only set under the synchronization required by `Node::retire`.
+        // `RETIRED` is only set under the synchronization required by `Node::retire`,
+        // so a plain load is enough to see it.
         if node.state.load(Ordering::Relaxed) & RETIRED != 0 {
             drop(node);
             return None;
         }
-        // Senders can only set `ENQUEUED`, which is already set.
-        node.state.store(0, Ordering::Release);
+        // This must be a read-modify-write, a plain store is not enough.
+        // A sender that wants to wake this node publishes its data first,
+        // and then does `fetch_or(ENQUEUED)`. Both operations modify the same atomic, so:
+        // * either the sender goes first, sees `ENQUEUED` and backs off. Then this swap
+        //   reads what the sender wrote, which makes the sender's data visible to the caller
+        //   (who is about to poll the task),
+        // * or this swap goes first, and the sender enqueues the node again.
+        // With a plain store there is a third outcome: the sender backs off,
+        // and the poll does not see its data (the store may still sit in the store buffer
+        // of this thread when the sender looks at the state).
+        //
+        // Do not clear `RETIRED` here. The check above makes sure that it is not set.
+        let prev = node.state.swap(0, Ordering::AcqRel);
+        debug_assert_eq!(prev, ENQUEUED);
         Some(ManuallyDrop::new(node))
     }
 }
@@ -638,6 +657,24 @@ impl WakerSlot {
             return;
         }
         self.notify_slow();
+    }
+
+    /// Removes the registered waker, if there is one. Must only be called by the receiver.
+    fn disarm(&self) {
+        if self
+            .state
+            .compare_exchange(ARMED, BUSY, Ordering::SeqCst, Ordering::Acquire)
+            .is_err()
+        {
+            // A sender is waking the waker right now (or just did).
+            return;
+        }
+        let waker = unsafe {
+            // SAFETY: we moved the state from `ARMED` to `BUSY`.
+            (*self.waker.get()).take()
+        };
+        self.state.store(EMPTY, Ordering::Release);
+        drop(waker);
     }
 
     #[cold]
@@ -760,6 +797,42 @@ mod test {
                 }
             };
             assert!(unsafe { dequeued.into_live() }.is_some());
+
+            unsafe { node.retire() };
+        });
+    }
+
+    /// A sender publishes data and wakes a node that is already dequeued, but not polled yet.
+    /// Either the poll sees the data, or the node is enqueued again.
+    #[cfg(loom)]
+    #[test]
+    fn loom_wake_between_dequeue_and_poll_is_not_lost() {
+        use loom::sync::atomic::{AtomicBool, Ordering};
+
+        loom::model(|| {
+            let mut receiver = Receiver::default();
+            let node = receiver.queue().create(());
+            let data = Arc::new(AtomicBool::new(false));
+            node.enqueue_by_ref();
+            let dequeued = receiver.dequeue().unwrap();
+
+            let sender = {
+                let node = node.clone();
+                let data = data.clone();
+                loom::thread::spawn(move || {
+                    data.store(true, Ordering::Release);
+                    node.enqueue();
+                })
+            };
+
+            // This is what the selector does before it polls the task.
+            assert!(unsafe { dequeued.into_live() }.is_some());
+            let seen = data.load(Ordering::Acquire);
+
+            sender.join().unwrap();
+            if !seen {
+                assert!(receiver.dequeue().is_some(), "lost wakeup");
+            }
 
             unsafe { node.retire() };
         });
@@ -935,18 +1008,20 @@ mod test {
         // Queue is not empty, parking must be refused.
         assert!(!queue.park(&waker));
         assert!(unsafe { queue.dequeue().unwrap().into_live() }.is_some());
-        // The refused park left the waker behind, which is fine.
+        // The refused park must not leave the waker behind.
+        assert_eq!(Arc::strong_count(&counter), 2);
         second.enqueue_by_ref();
-        assert_eq!(wakeups(), 1);
+        assert_eq!(wakeups(), 0);
         assert!(unsafe { queue.dequeue().unwrap().into_live() }.is_some());
 
         assert!(!queue.has_pending());
         assert!(queue.park(&waker));
         assert!(queue.park(&waker));
+        assert_eq!(Arc::strong_count(&counter), 3);
         first.enqueue_by_ref();
-        assert_eq!(wakeups(), 2);
+        assert_eq!(wakeups(), 1);
         second.enqueue_by_ref();
-        assert_eq!(wakeups(), 2);
+        assert_eq!(wakeups(), 1);
 
         unsafe {
             first.retire();

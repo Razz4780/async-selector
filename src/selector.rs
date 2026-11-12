@@ -69,22 +69,39 @@ pub use crate::selector::{
 /// If the [`Task`] implementation panics, the task is removed from the selector and dropped,
 /// and the panic propagates. The selector remains valid.
 pub struct Selector<T, S> {
-    /// List of all tasks.
-    ///
-    /// Must be dropped before the queue (see [`Receiver`]).
-    list: List<T>,
-    /// Queue of tasks that received a wakeup.
-    queue: Receiver<list::ListProtected<T>>,
+    tasks: Tasks<T>,
     /// Strategy that determines how the selector polls the tasks.
     strategy: S,
+}
+
+/// List of all tasks, bundled with the queue of tasks that received a wakeup.
+///
+/// The queue requires that all tasks are removed from the list before the queue is dropped
+/// (see [`Receiver`]). This type exists to enforce that in one place,
+/// instead of relying on the order of fields in every type that owns both.
+struct Tasks<T> {
+    /// Queue of tasks that received a wakeup.
+    queue: Receiver<list::ListProtected<T>>,
+    /// List of all tasks.
+    list: List<T>,
+}
+
+impl<T> Drop for Tasks<T> {
+    fn drop(&mut self) {
+        // Runs before any field is dropped.
+        // If a task panics when dropped, the list still removes all the remaining tasks.
+        self.list.clear();
+    }
 }
 
 impl<T, S> Selector<T, S> {
     /// Creates an empty selector with the given strategy.
     pub fn new(strategy: S) -> Self {
         Self {
-            queue: Default::default(),
-            list: Default::default(),
+            tasks: Tasks {
+                queue: Default::default(),
+                list: Default::default(),
+            },
             strategy,
         }
     }
@@ -95,21 +112,21 @@ impl<T, S> Selector<T, S> {
     ///
     /// This method is O(1).
     pub fn push(&mut self, task: T) -> BorrowedMut<'_, T> {
-        BorrowedMut(self.list.push_back(self.queue.queue(), task))
+        BorrowedMut(self.tasks.list.push_back(self.tasks.queue.queue(), task))
     }
 
     /// Returns the number of tasks stored in the selector.
     ///
     /// This method is O(1).
     pub fn len(&self) -> usize {
-        self.list.len()
+        self.tasks.list.len()
     }
 
     /// Returns whether the selector is empty.
     ///
     /// This method is O(1).
     pub fn is_empty(&self) -> bool {
-        self.list.is_empty()
+        self.tasks.list.is_empty()
     }
 
     /// Returns whether the selector contains a task with the given [`Id`].
@@ -126,7 +143,7 @@ impl<T, S> Selector<T, S> {
         if self.created(id.get()).not() {
             return None;
         }
-        unsafe { self.list.get(id.get()).map(Borrowed) }
+        unsafe { self.tasks.list.get(id.get()).map(Borrowed) }
     }
 
     /// If the selector contains a task with the given [`Id`], returns a mutable reference to it.
@@ -136,7 +153,7 @@ impl<T, S> Selector<T, S> {
         if self.created(id.get()).not() {
             return None;
         }
-        unsafe { self.list.get_mut(id.get()).map(BorrowedMut) }
+        unsafe { self.tasks.list.get_mut(id.get()).map(BorrowedMut) }
     }
 
     /// If the selector contains a task with the given [`Id`], removes it.
@@ -146,7 +163,7 @@ impl<T, S> Selector<T, S> {
         if self.created(id.get()).not() {
             return None;
         }
-        unsafe { self.list.remove(id.get()).map(Removed) }
+        unsafe { self.tasks.list.remove(id.get()).map(Removed) }
     }
 
     /// Returns a reference to the strategy used by this selector.
@@ -162,8 +179,7 @@ impl<T, S> Selector<T, S> {
     /// Returns a new selector with the same state, but different strategy.
     pub fn with_strategy<S1>(self, strategy: S1) -> Selector<T, S1> {
         Selector {
-            queue: self.queue,
-            list: self.list,
+            tasks: self.tasks,
             strategy,
         }
     }
@@ -172,14 +188,14 @@ impl<T, S> Selector<T, S> {
     ///
     /// The tasks are visited in the insertion order.
     pub fn iter(&self) -> iter::Iter<'_, T> {
-        iter::Iter(self.list.cursor())
+        iter::Iter(self.tasks.list.cursor())
     }
 
     /// Returns an iterator that allows for modifying each task in the selector.
     ///
     /// The tasks are visited in the insertion order.
     pub fn iter_mut(&mut self) -> iter::IterMut<'_, T> {
-        iter::IterMut(self.list.cursor_mut())
+        iter::IterMut(self.tasks.list.cursor_mut())
     }
 
     /// Creates an iterator which uses a closure to determine if a task should be removed.
@@ -195,7 +211,7 @@ impl<T, S> Selector<T, S> {
         F: for<'b> FnMut(BorrowedMut<'b, T>) -> bool,
     {
         ExtractIf {
-            cursor: self.list.cursor_mut(),
+            cursor: self.tasks.list.cursor_mut(),
             pred,
         }
     }
@@ -213,7 +229,7 @@ impl<T, S> Selector<T, S> {
 
     /// Manually wakes all tasks in the selector.
     pub fn wake_all(&self) {
-        let queue = self.queue.queue();
+        let queue = self.tasks.queue.queue();
         self.iter().for_each(|task| unsafe {
             // SAFETY: the task was created from this queue.
             queue.enqueue_silent(task.id().get());
@@ -222,7 +238,7 @@ impl<T, S> Selector<T, S> {
     }
 
     fn created(&self, task: &Node<T>) -> bool {
-        let this_queue_ptr = Arc::as_ptr(self.queue.queue());
+        let this_queue_ptr = Arc::as_ptr(self.tasks.queue.queue());
         let task_queue_ptr = Weak::as_ptr(task.queue());
         this_queue_ptr == task_queue_ptr
     }
@@ -252,10 +268,7 @@ impl<T, S> IntoIterator for Selector<T, S> {
     type Item = Removed<T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        iter::IntoIter {
-            list: self.list,
-            _queue: self.queue,
-        }
+        iter::IntoIter(self.tasks)
     }
 }
 
@@ -287,9 +300,9 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        let marker = this.queue.marker();
+        let marker = this.tasks.queue.marker();
         if marker.is_null().not() {
-            while let Some(dequeued) = this.queue.dequeue() {
+            while let Some(dequeued) = this.tasks.queue.dequeue() {
                 let is_last = dequeued.as_ptr() == marker;
 
                 let node = unsafe {
@@ -308,7 +321,7 @@ where
                 let mut guard = unsafe {
                     // SAFETY: node was dequeued from our queue and is not retired,
                     // so it is stored in our list.
-                    this.list.access(&node)
+                    this.tasks.list.access(&node)
                 };
 
                 let result = {
@@ -323,7 +336,7 @@ where
                     Poll::Ready(ControlFlow::Continue(val)) => {
                         unsafe {
                             // SAFETY: node was dequeued from this queue and is not retired
-                            this.queue.requeue(&node);
+                            this.tasks.queue.requeue(&node);
                         }
                         let output = T::transform_cont(
                             BorrowedMut(guard.borrow_mut()),
@@ -355,7 +368,7 @@ where
             }
         }
 
-        if this.list.is_empty() {
+        if this.tasks.list.is_empty() {
             return Poll::Ready(None);
         }
 
@@ -363,14 +376,14 @@ where
         // 1. If there may be tasks waiting in the queue (we finished the pass over the snapshot,
         //    or an enqueue is in progress), yield to the executor and come back.
         // 2. Otherwise, go to sleep. This is the only place where we register the waker.
-        if this.queue.has_pending() || this.queue.park(cx.waker()).not() {
+        if this.tasks.queue.has_pending() || this.tasks.queue.park(cx.waker()).not() {
             cx.waker().wake_by_ref();
         }
         Poll::Pending
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, self.list.is_empty().then_some(0))
+        (0, self.tasks.list.is_empty().then_some(0))
     }
 }
 
@@ -389,9 +402,9 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Selector")
-            .field("tasks", &self.list.len())
+            .field("tasks", &self.tasks.list.len())
             .field("strategy", &self.strategy)
-            .field("queue_ptr", &Arc::as_ptr(self.queue.queue()))
+            .field("queue_ptr", &Arc::as_ptr(self.tasks.queue.queue()))
             .finish_non_exhaustive()
     }
 }

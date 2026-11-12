@@ -77,38 +77,26 @@ impl WakerSlot {
     }
 
     /// Removes the registered waker, if there is one. Must only be called by the receiver.
-    pub fn disarm(&self) {
+    pub fn disarm(&self) -> Option<Waker> {
         if self
             .state
             .compare_exchange(ARMED, BUSY, Ordering::SeqCst, Ordering::Acquire)
             .is_err()
         {
             // A sender is waking the waker right now (or just did).
-            return;
+            return None;
         }
         let waker = unsafe {
             // SAFETY: we moved the state from `ARMED` to `BUSY`.
             (*self.waker.get()).take()
         };
         self.state.store(EMPTY, Ordering::Release);
-        drop(waker);
+        waker
     }
 
     #[cold]
     fn notify_slow(&self) {
-        if self
-            .state
-            .compare_exchange(ARMED, BUSY, Ordering::SeqCst, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let waker = unsafe {
-            // SAFETY: we moved the state from `ARMED` to `BUSY`.
-            (*self.waker.get()).take()
-        };
-        self.state.store(EMPTY, Ordering::Release);
-        if let Some(waker) = waker {
+        if let Some(waker) = self.disarm() {
             waker.wake();
         }
     }

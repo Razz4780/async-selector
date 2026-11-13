@@ -1,11 +1,14 @@
-//! [`Selector`](super::Selector) visitors.
+//! Iterators over the tasks stored in a [`Selector`](super::Selector).
 
 use crate::{
     list::{Cursor, List},
     selector::{Borrowed, BorrowedMut, Removed, Tasks},
 };
 
+/// Iterator that removes all tasks from a [`Selector`](super::Selector).
+///
 /// Returned from [`Selector::into_iter`](super::Selector::into_iter).
+/// Yields the tasks in the order in which they were pushed.
 pub struct IntoIter<T>(pub(super) Tasks<T>);
 
 impl<T> Iterator for IntoIter<T> {
@@ -33,7 +36,10 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
     }
 }
 
+/// Iterator over shared references to the tasks stored in a [`Selector`](super::Selector).
+///
 /// Returned from [`Selector::iter`](super::Selector::iter).
+/// Yields the tasks in the order in which they were pushed.
 pub struct Iter<'a, T>(pub(super) Cursor<T, &'a List<T>>);
 
 impl<'a, T> Iterator for Iter<'a, T> {
@@ -61,7 +67,10 @@ impl<T> DoubleEndedIterator for Iter<'_, T> {
     }
 }
 
+/// Iterator over mutable references to the tasks stored in a [`Selector`](super::Selector).
+///
 /// Returned from [`Selector::iter_mut`](super::Selector::iter_mut).
+/// Yields the tasks in the order in which they were pushed.
 pub struct IterMut<'a, T>(pub(super) Cursor<T, &'a mut List<T>>);
 
 impl<'a, T> Iterator for IterMut<'a, T> {
@@ -89,7 +98,10 @@ impl<T> DoubleEndedIterator for IterMut<'_, T> {
     }
 }
 
+/// Iterator that removes the tasks matching a predicate from a [`Selector`](super::Selector).
+///
 /// Returned from [`Selector::extract_if`](super::Selector::extract_if).
+/// If dropped before it is exhausted, the remaining tasks stay in the selector.
 pub struct ExtractIf<'a, T, F> {
     pub(super) cursor: Cursor<T, &'a mut List<T>>,
     pub(super) pred: F,

@@ -460,7 +460,7 @@ impl<T> Node<T> {
                 queue.waker.notify();
                 #[cfg(loom)]
                 queue.arc_sync.fetch_add(1, Ordering::AcqRel);
-            }
+            },
             None => {
                 // The receiver is gone, so this node was retired,
                 // and that happened after we set the `ENQUEUED` bit
@@ -472,7 +472,7 @@ impl<T> Node<T> {
                 // The order of this decrement and the increment in `Node::retire`
                 // does not matter: we hold our own reference to the node.
                 unsafe { Arc::decrement_strong_count(Arc::as_ptr(self)) };
-            }
+            },
         }
     }
 
@@ -668,7 +668,7 @@ mod test {
                         assert!(flag.0.load(Ordering::SeqCst), "lost wakeup");
                     }
                     receiver.dequeue().expect("node should be in the queue")
-                }
+                },
             };
             assert!(unsafe { dequeued.into_live() }.is_some());
 

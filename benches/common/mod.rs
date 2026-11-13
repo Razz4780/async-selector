@@ -76,7 +76,7 @@ impl Driver {
         loop {
             match Pin::new(&mut *stream).poll_next(&mut cx) {
                 Poll::Ready(item) => break Some(item),
-                Poll::Pending if self.flag.0.swap(false, Ordering::Relaxed) => {}
+                Poll::Pending if self.flag.0.swap(false, Ordering::Relaxed) => {},
                 Poll::Pending => break None,
             }
         }

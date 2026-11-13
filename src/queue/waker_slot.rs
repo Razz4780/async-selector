@@ -38,7 +38,7 @@ impl WakerSlot {
                 #[cfg(loom)]
                 loom::sync::atomic::fence(Ordering::SeqCst);
                 true
-            }
+            },
             ARMED => {
                 if self
                     .state
@@ -53,7 +53,7 @@ impl WakerSlot {
                     // SAFETY: we moved the state from `ARMED` to `BUSY`.
                     let slot = &mut *self.waker.get();
                     match slot {
-                        Some(old) if old.will_wake(waker) => {}
+                        Some(old) if old.will_wake(waker) => {},
                         _ => *slot = Some(waker.clone()),
                     }
                 }
@@ -61,7 +61,7 @@ impl WakerSlot {
                 #[cfg(loom)]
                 loom::sync::atomic::fence(Ordering::SeqCst);
                 true
-            }
+            },
             _ => false,
         }
     }

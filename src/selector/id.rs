@@ -7,8 +7,36 @@ use crate::list::Node;
 
 /// Unique ID of a task pushed into a [`Selector`](crate::selector::Selector).
 ///
-/// This ID is always unique relative to all other IDs,
-/// including IDs obtained from other selectors.
+/// You get the ID from the reference returned by [`Selector::push`](crate::selector::Selector::push),
+/// from [`Borrowed::id`](crate::selector::Borrowed::id), and from the items yielded by
+/// the `*WithId` and `*Reclaim` selectors (e.g. [`StreamWithIdSelector`](crate::StreamWithIdSelector)).
+/// Use it to access, remove, or wake the task later.
+///
+/// IDs are cheap to clone, and they implement [`Eq`] and [`Hash`](std::hash::Hash),
+/// so you can use them as map keys.
+/// An ID is unique among all IDs, including IDs of tasks pushed into other selectors,
+/// and it is never reused while it exists.
+///
+/// An ID keeps the task's heap allocation alive (but not the task itself),
+/// so don't keep IDs of removed tasks around forever.
+///
+/// ```
+/// use async_selector::FutureSelector;
+///
+/// let mut selector = FutureSelector::default();
+/// let id = selector.push(std::future::ready(1)).id().clone();
+///
+/// // The ID gives O(1) access to the task...
+/// assert!(selector.get(&id).is_some());
+///
+/// // ...even if it's a clone.
+/// let cloned = id.clone();
+/// assert_eq!(cloned, id);
+/// assert!(selector.remove(&cloned).is_some());
+///
+/// // Once the task is removed, the ID no longer matches anything.
+/// assert!(selector.get(&id).is_none());
+/// ```
 #[repr(transparent)]
 pub struct Id<C>(Arc<Node<C>>);
 
@@ -22,7 +50,12 @@ impl<C> Id<C> {
         &self.0
     }
 
-    /// Manually wakes this task.
+    /// Wakes the task, so that the selector polls it the next time the selector is polled.
+    ///
+    /// This has the same effect as waking the [`Waker`](std::task::Waker)
+    /// that was passed to the task when it was polled.
+    /// Use it after you modify the task in a way that can make it ready
+    /// (see [wakeups](crate::selector::Selector#wakeups)).
     ///
     /// Does nothing if the task is no longer stored in the selector.
     pub fn wake(&self) {

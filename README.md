@@ -8,58 +8,146 @@
 
 Fast and flexible selector for asynchronous tasks (generalized `Future`s and `Stream`s).
 
-Inspired by [`FuturesUnordered`](https://docs.rs/futures/latest/futures/stream/struct.FuturesUnordered.html),
-but more flexible and optimized. Provides optimal performance when polling a large number of tasks
-(see [benchmarks](https://github.com/Razz4780/async-selector/tree/main/benches)).
+A selector holds a dynamic set of tasks and polls them all concurrently, on the same thread.
+You push tasks into it, and then use it as a single `Stream`
+that yields the tasks' results as soon as they are ready.
 
-Allows for:
-* Polling multiple tasks concurrently on the same thread
-* Safe injection of mutable shared state into the polling logic,
-  meaning that caller code can provide a custom polling function with a strongly typed context
-* Fast O(1) task access and removal with unique IDs
+It is inspired by [`FuturesUnordered`](https://docs.rs/futures/latest/futures/stream/struct.FuturesUnordered.html),
+but it is more flexible, and faster when polling a large number of tasks
+(see [performance](#performance)).
 
-The main struct is `Selector`, which works with any `Task` implementor.
-For convenience, this crate exposes multiple specializations of the selector,
-including `FutureSelector` and `StreamSelector` (*almost* API-compatible with
-`FuturesUnordered`/`SelectAll`).
+## Features
 
-## Examples
+* Polls many tasks concurrently on the same thread, without spawning them.
+* Only polls the tasks that were woken up, in a round-robin fashion.
+* Gives each task a unique ID, which allows for O(1) access and removal.
+* Lets you inject mutable shared state into the polling logic
+  (e.g. a buffer shared by all tasks), without any synchronization or `unsafe` code.
+  See [`Task`](https://docs.rs/async-selector/latest/async_selector/task/trait.Task.html) for details.
 
-Simply flatten a set of streams:
+## Quick start
+
+Poll a set of futures, and receive their outputs in completion order:
 
 ```rust
+use async_selector::FutureSelector;
+use futures::{StreamExt, channel::oneshot};
+
+let mut selector = FutureSelector::default();
+
+// Each oneshot receiver is a future that resolves when its sender sends a value.
+let mut senders = Vec::new();
+for _ in 0..3 {
+    let (tx, rx) = oneshot::channel::<&str>();
+    senders.push(tx);
+    selector.push(rx);
+}
+assert_eq!(selector.len(), 3);
+
+// The selector is a `Stream` of the futures' outputs,
+// so you can await the next one with `StreamExt::next`.
+senders.pop().unwrap().send("third").unwrap();
+assert_eq!(selector.next().await, Some(Ok("third")));
+
+// A future is dropped as soon as it resolves.
+assert_eq!(selector.len(), 2);
+
+senders.remove(0).send("first").unwrap();
+assert_eq!(selector.next().await, Some(Ok("first")));
+```
+
+Merge a set of streams into one:
+
+```rust
+use async_selector::StreamSelector;
+use futures::StreamExt;
+
+// Push three infinite streams that repeat 0, 1, and 2 respectively.
 let mut selector = StreamSelector::default();
 for i in 0..3 {
-    let stream = futures::stream::repeat(i);
-    selector.push(stream);
+    selector.push(futures::stream::repeat(i));
 }
-let collected = (&mut selector).take(6).collect::<Vec<_>>().await;
-assert_eq!(
-    collected,
-    vec![0, 1, 2, 0, 1, 2],
-);
+
+// Ready streams take turns, so no stream can starve the others.
+let items = (&mut selector).take(6).collect::<Vec<_>>().await;
+assert_eq!(items, [0, 1, 2, 0, 1, 2]);
 ```
 
-Use as a map of streams:
+## Choosing a selector
+
+The main type is `Selector`, which can hold any type implementing `Task`.
+What the selector yields is decided by its *strategy*.
+The strategies that cover the common cases live in the `task::strategy` module,
+and the crate root exposes a type alias for each of them:
+
+| Alias                      | Holds        | Yields                                                             | When a task finishes               |
+|----------------------------|--------------|--------------------------------------------------------------------|------------------------------------|
+| `FutureSelector`           | `Future`s    | `F::Output`                                                        | it's dropped                       |
+| `FutureReclaimSelector`    | `Future`s    | `(Removed<F>, F::Output)`                                          | it's returned with the output      |
+| `StreamSelector`           | `Stream`s    | `S::Item`                                                          | it's dropped                       |
+| `StreamWithIdSelector`     | `Stream`s    | `(Id<S>, S::Item)`                                                 | it's dropped                       |
+| `StreamReclaimSelector`    | `Stream`s    | `ControlFlow<Removed<S>, (Id<S>, S::Item)>`                        | it's returned as `Break`           |
+| `TryStreamSelector`        | `TryStream`s | `Result<S::Ok, S::Error>`                                          | it's dropped (also after an error) |
+| `TryStreamWithIdSelector`  | `TryStream`s | `(Id<S>, Result<S::Ok, S::Error>)`                                 | it's dropped (also after an error) |
+| `TryStreamReclaimSelector` | `TryStream`s | `ControlFlow<(Removed<S>, Result<(), S::Error>), (Id<S>, S::Ok)>`  | it's returned as `Break`           |
+
+`TryStream` selectors stop polling a stream after its first error.
+
+`FutureSelector` and `StreamSelector` are *almost* API-compatible with
+`FuturesUnordered` and `SelectAll`, so they can serve as drop-in replacements.
+
+If none of the strategies fit your use case, you can implement `Task` with your own strategy
+(see the [custom task example](https://github.com/Razz4780/async-selector/blob/main/examples/custom.rs)).
+
+## Working with task IDs
+
+Every task pushed into a selector gets a unique `Id`.
+You can use it to access or remove the task later,
+and the `*WithId` selectors attach it to each yielded item,
+so you know which task produced it.
 
 ```rust
+use async_selector::StreamWithIdSelector;
+use futures::{StreamExt, channel::mpsc};
+
 let mut selector = StreamWithIdSelector::default();
-let ids = (0..3)
-    .map(|i| {
-        let stream = futures::stream::repeat(i);
-        selector.push(stream).id().clone()
-    })
-    .collect::<Vec<_>>();
-let item = selector.next().await.unwrap();
-assert_eq!(item.0, ids[0]);
-assert_eq!(item.1, 0);
-selector.remove(&ids[1]);
-let item = selector.next().await.unwrap();
-assert_eq!(item.0, ids[2]);
-assert_eq!(item.1, 2);
+
+// `push` returns a reference to the stored task, which knows the task's ID.
+let (tx_a, rx_a) = mpsc::unbounded::<&str>();
+let (tx_b, rx_b) = mpsc::unbounded::<&str>();
+let id_a = selector.push(rx_a).id().clone();
+let id_b = selector.push(rx_b).id().clone();
+
+// Each item is paired with the ID of the stream that produced it.
+tx_b.unbounded_send("hello from b").unwrap();
+let (id, item) = selector.next().await.unwrap();
+assert_eq!(id, id_b);
+assert_eq!(item, "hello from b");
+
+// Remove a stream by its ID. This gives the stream back to you.
+let removed = selector.remove(&id_a).unwrap();
+assert!(!selector.contains(&id_a));
+let rx_a = removed.into_inner();
 ```
 
-More examples live [here](https://github.com/Razz4780/async-selector/tree/main/examples).
+For a bigger example, see the
+[map example](https://github.com/Razz4780/async-selector/blob/main/examples/map.rs),
+which builds a stream map keyed by arbitrary keys on top of `StreamSelector`.
+
+## Things to keep in mind
+
+* **A task is only polled after it is woken up** (or right after it is pushed,
+  or right after it yields an item).
+  If you change a task or the strategy in a way that should make the task ready,
+  wake it manually with `Id::wake` or `Selector::wake_all`.
+* **The selector yields `None` when it is empty**, but it is not exhausted for good.
+  You can push more tasks and keep polling.
+* **Every task lives in its own heap allocation.**
+  An `Id` keeps that allocation alive (but not the task itself),
+  so don't keep IDs of removed tasks around forever.
+
+More examples live [here](https://github.com/Razz4780/async-selector/tree/main/examples),
+and the full API documentation is on [docs.rs](https://docs.rs/async-selector).
 
 ## Performance
 

@@ -1,3 +1,10 @@
+//! The [`Selector`] type, along with the types used to access the tasks stored in it.
+//!
+//! * [`Id`] identifies a task stored in a selector.
+//! * [`Borrowed`] and [`BorrowedMut`] are references to a task stored in a selector.
+//! * [`Removed`] is a task removed from a selector.
+//! * The [`iter`] module contains iterators over the stored tasks.
+
 mod id;
 pub mod iter;
 mod waker;
@@ -29,45 +36,110 @@ pub use crate::selector::{
 
 /// Selector over a dynamic set of [`Task`]s (generalized [`Future`]s/[`Stream`]s).
 ///
-/// Inspired by [`FuturesUnordered`](futures::stream::FuturesUnordered),
-/// designed for flexibility and optimal performance when polling a large number of tasks.
+/// You push tasks into the selector, and then poll it as a [`Stream`].
+/// The selector polls the tasks that are ready to make progress,
+/// and yields their results (the [`Task::Output`] values).
 ///
-/// Unless you want to exercise the full flexibility of this type,
-/// you can stick to the specializations exposed in the root of this crate
-/// (e.g. [`FutureSelector`](crate::FutureSelector) and [`StreamSelector`](crate::StreamSelector)).
+/// The type parameters are:
+/// * `T` - the type of the stored tasks.
+/// * `S` - the strategy, which decides how the tasks are polled and what the selector yields.
+///   See [`Task`] and [`strategy`](crate::task::strategy).
 ///
-/// # Removal
+/// Usually you don't need to name the strategy yourself.
+/// The crate root exposes a type alias for each of the built-in strategies,
+/// e.g. [`FutureSelector`](crate::FutureSelector) and [`StreamSelector`](crate::StreamSelector)
+/// (see [choosing a selector](crate#choosing-a-selector)).
 ///
-/// The selector creates a heap allocation for each stored task.
-/// Removing a task from the selector does not instantly free that memory.
-/// The memory can only be freed when:
-/// 1. all [`Id`] instances for this task are dropped, AND
-/// 2. [`Removed`] instance is dropped, AND
-/// 3. the [`Waker`](std::task::Waker) (and all its clones)
-///    passed when polling the task is dropped, AND
-/// 4. the selector observes the task removal
-///    (which happens when the selector is polled).
+/// # Example
+///
+/// A typical event loop, which accepts new jobs and collects the results of the finished ones
+/// at the same time:
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use async_selector::FutureSelector;
+/// use futures::StreamExt;
+/// use tokio::sync::mpsc;
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// // Jobs are submitted through a channel.
+/// // Each job is the number of milliseconds it takes to complete.
+/// let (job_tx, mut job_rx) = mpsc::unbounded_channel::<u64>();
+/// for millis in [30, 10, 20] {
+///     job_tx.send(millis).unwrap();
+/// }
+/// // Close the channel, so that the loop below knows that no more jobs are coming.
+/// drop(job_tx);
+///
+/// let mut jobs = FutureSelector::default();
+/// let mut results = Vec::new();
+/// loop {
+///     tokio::select! {
+///         // Got a new job, start running it.
+///         Some(millis) = job_rx.recv() => {
+///             jobs.push(async move {
+///                 tokio::time::sleep(Duration::from_millis(millis)).await;
+///                 millis
+///             });
+///         }
+///
+///         // A job finished.
+///         // When the selector is empty, `next` returns `None`, which does not match
+///         // the pattern. This disables the branch, instead of spinning in the loop.
+///         Some(millis) = jobs.next() => results.push(millis),
+///
+///         // The channel is closed and all jobs finished.
+///         else => break,
+///     }
+/// }
+///
+/// results.sort();
+/// assert_eq!(results, [10, 20, 30]);
+/// # }
+/// ```
 ///
 /// # Wakeups
 ///
-/// The selector uses a smart strategy for polling the tasks.
-/// A task is **only** polled in the following cases:
-/// 1. after it is pushed into the selector
-/// 2. after it yields a non-terminal value
-/// 3. after the waker passed to [`Task::poll_progress`] receives a wakeup
+/// The selector does not poll all of its tasks every time it is polled.
+/// A task is polled **only**:
+/// 1. right after it is pushed into the selector,
+/// 2. right after it yields a non-terminal value ([`ControlFlow::Continue`]),
+///    so that it can produce the next one,
+/// 3. after the [`Waker`](std::task::Waker) passed to [`Task::poll_progress`] is woken.
 ///
-/// To avoid nasty surprises, keep this in mind when:
-/// 1. Modifying a task borrowed from the selector
-/// 2. Changing the strategy used by the selector
-///    (see [example](https://github.com/Razz4780/async-selector/blob/main/examples/custom.rs))
+/// This is what makes the selector fast when it holds many idle tasks,
+/// but it can surprise you when you change something that affects a task's readiness
+/// without waking the task, for example when you:
+/// 1. modify a task through [`get_mut`](Self::get_mut) or [`iter_mut`](Self::iter_mut),
+/// 2. change the strategy with [`strategy_mut`](Self::strategy_mut)
+///    or [`with_strategy`](Self::with_strategy).
 ///
-/// The wakeups are stored in a FIFO queue. This implies that the selector
-/// processes ready tasks in a round-robin fashion.
+/// In such cases, wake the affected tasks manually with [`Id::wake`] or [`Selector::wake_all`]
+/// (see the [custom task example](https://github.com/Razz4780/async-selector/blob/main/examples/custom.rs)).
 ///
-/// # Panic
+/// Woken tasks are polled in the order in which they were woken (FIFO).
+/// This means that ready tasks take turns, and no task can starve the others.
 ///
-/// If the [`Task`] implementation panics, the task is removed from the selector and dropped,
-/// and the panic propagates. The selector remains valid.
+/// # Memory
+///
+/// Each task lives in its own heap allocation.
+///
+/// When you remove a task, you get back a [`Removed`] handle, which owns the task.
+/// Dropping the handle drops the task right away.
+/// However, the allocation itself is freed only when all of the following are dropped:
+/// 1. all [`Id`]s of the task,
+/// 2. the [`Removed`] handle,
+/// 3. all clones of the [`Waker`](std::task::Waker) that was passed to the task when it was polled,
+/// 4. the selector's own reference, if the task was woken before it was removed.
+///    The selector releases it the next time it is polled.
+///
+/// # Panics
+///
+/// If the [`Task`] implementation panics while the selector polls it,
+/// the task is removed from the selector and dropped, and the panic propagates to the caller.
+/// The selector remains valid, and you can keep using it.
 pub struct Selector<T, S> {
     tasks: Tasks<T>,
     /// Strategy that determines how the selector polls the tasks.
@@ -96,6 +168,16 @@ impl<T> Drop for Tasks<T> {
 
 impl<T, S> Selector<T, S> {
     /// Creates an empty selector with the given strategy.
+    ///
+    /// If the strategy implements [`Default`] (all built-in strategies do),
+    /// you can use [`Selector::default`] instead.
+    ///
+    /// ```
+    /// use async_selector::{selector::Selector, task::strategy::FutureBasic};
+    ///
+    /// let selector = Selector::<std::future::Ready<u32>, _>::new(FutureBasic);
+    /// assert!(selector.is_empty());
+    /// ```
     pub fn new(strategy: S) -> Self {
         Self {
             tasks: Tasks {
@@ -106,11 +188,29 @@ impl<T, S> Selector<T, S> {
         }
     }
 
-    /// Pushes the given task into the selector, returning a mutable reference to the task.
+    /// Pushes a task into the selector.
     ///
-    /// The reference can be used to obtain the task's [`Id`].
+    /// The task will be polled the next time the selector is polled.
+    ///
+    /// Returns a mutable reference to the stored task,
+    /// which you can use to get the task's [`Id`].
+    /// If you don't need it, simply ignore the return value.
     ///
     /// This method is O(1).
+    ///
+    /// ```
+    /// use async_selector::FutureSelector;
+    ///
+    /// let mut selector = FutureSelector::default();
+    ///
+    /// // Keep the ID to access the task later...
+    /// let id = selector.push(std::future::ready(1)).id().clone();
+    /// // ...or just ignore it.
+    /// selector.push(std::future::ready(2));
+    ///
+    /// assert_eq!(selector.len(), 2);
+    /// assert!(selector.contains(&id));
+    /// ```
     pub fn push(&mut self, task: T) -> BorrowedMut<'_, T> {
         BorrowedMut(self.tasks.list.push_back(self.tasks.queue.queue(), task))
     }
@@ -122,23 +222,61 @@ impl<T, S> Selector<T, S> {
         self.tasks.list.len()
     }
 
-    /// Returns whether the selector is empty.
+    /// Returns `true` if the selector holds no tasks.
     ///
     /// This method is O(1).
     pub fn is_empty(&self) -> bool {
         self.tasks.list.is_empty()
     }
 
-    /// Returns whether the selector contains a task with the given [`Id`].
+    /// Returns `true` if the selector holds the task with the given [`Id`].
+    ///
+    /// Returns `false` if the task was removed (or has finished),
+    /// or if the [`Id`] comes from a different selector.
     ///
     /// This method is O(1).
+    ///
+    /// ```
+    /// use async_selector::FutureSelector;
+    ///
+    /// let mut selector = FutureSelector::default();
+    /// let id = selector.push(std::future::ready(1)).id().clone();
+    /// assert!(selector.contains(&id));
+    ///
+    /// selector.remove(&id);
+    /// assert!(!selector.contains(&id));
+    /// ```
     pub fn contains(&self, id: &Id<T>) -> bool {
         self.get(id).is_some()
     }
 
-    /// If the selector contains a task with the given [`Id`], returns a reference to it.
+    /// Returns a reference to the task with the given [`Id`],
+    /// or [`None`] if the selector does not hold it.
+    ///
+    /// The returned [`Borrowed`] dereferences to the task.
+    /// You can also use indexing (`selector[&id]`), which panics if the task is not found.
     ///
     /// This method is O(1).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use async_selector::FutureSelector;
+    /// use tokio::time::{Instant, sleep};
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let mut timers = FutureSelector::default();
+    /// let id = timers.push(sleep(Duration::from_secs(60))).id().clone();
+    ///
+    /// // `Borrowed` dereferences to `Sleep`, so we can call its methods directly.
+    /// let timer = timers.get(&id).unwrap();
+    /// assert!(timer.deadline() > Instant::now());
+    ///
+    /// // The same, using indexing.
+    /// assert!(timers[&id].deadline() > Instant::now());
+    /// # }
+    /// ```
     pub fn get<'a>(&'a self, id: &Id<T>) -> Option<Borrowed<'a, T>> {
         if self.created(id.get()).not() {
             return None;
@@ -146,9 +284,43 @@ impl<T, S> Selector<T, S> {
         unsafe { self.tasks.list.get(id.get()).map(Borrowed) }
     }
 
-    /// If the selector contains a task with the given [`Id`], returns a mutable reference to it.
+    /// Returns a mutable reference to the task with the given [`Id`],
+    /// or [`None`] if the selector does not hold it.
+    ///
+    /// The selector stores the tasks pinned, so the returned [`BorrowedMut`] gives you
+    /// a [`Pin<&mut T>`](BorrowedMut::get_pin_mut).
+    /// If the task is [`Unpin`], [`BorrowedMut`] also dereferences mutably to it,
+    /// and you can use indexing (`selector[&id]`), which panics if the task is not found.
+    ///
+    /// Keep in mind that the selector does not know that you modified the task.
+    /// If your change can make the task ready, wake it with [`Id::wake`]
+    /// (see [wakeups](Self#wakeups)).
     ///
     /// This method is O(1).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use async_selector::FutureSelector;
+    /// use futures::StreamExt;
+    /// use tokio::time::{Instant, sleep};
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let mut timers = FutureSelector::default();
+    /// let id = timers.push(sleep(Duration::from_secs(60))).id().clone();
+    ///
+    /// // `Sleep` is not `Unpin`, so we need a pinned reference to reset it.
+    /// let mut timer = timers.get_mut(&id).unwrap();
+    /// timer.get_pin_mut().reset(Instant::now());
+    ///
+    /// // Make sure the selector polls the timer again.
+    /// id.wake();
+    ///
+    /// // The timer fires right away, instead of after 60 seconds.
+    /// assert_eq!(timers.next().await, Some(()));
+    /// # }
+    /// ```
     pub fn get_mut<'a>(&'a mut self, id: &Id<T>) -> Option<BorrowedMut<'a, T>> {
         if self.created(id.get()).not() {
             return None;
@@ -156,9 +328,29 @@ impl<T, S> Selector<T, S> {
         unsafe { self.tasks.list.get_mut(id.get()).map(BorrowedMut) }
     }
 
-    /// If the selector contains a task with the given [`Id`], removes it.
+    /// Removes the task with the given [`Id`] from the selector,
+    /// or returns [`None`] if the selector does not hold it.
+    ///
+    /// The returned [`Removed`] owns the task.
+    /// Drop it to drop the task, or take the task out with [`Removed::into_inner`].
     ///
     /// This method is O(1).
+    ///
+    /// ```
+    /// use async_selector::StreamSelector;
+    /// use futures::channel::mpsc;
+    ///
+    /// let mut selector = StreamSelector::default();
+    /// let (_tx, rx) = mpsc::unbounded::<u32>();
+    /// let id = selector.push(rx).id().clone();
+    ///
+    /// // Take the receiver back out of the selector.
+    /// let _rx = selector.remove(&id).unwrap().into_inner();
+    /// assert!(selector.is_empty());
+    ///
+    /// // The task is gone, so removing it again returns `None`.
+    /// assert!(selector.remove(&id).is_none());
+    /// ```
     pub fn remove(&mut self, id: &Id<T>) -> Option<Removed<T>> {
         if self.created(id.get()).not() {
             return None;
@@ -172,11 +364,39 @@ impl<T, S> Selector<T, S> {
     }
 
     /// Returns a mutable reference to the strategy used by this selector.
+    ///
+    /// If your change to the strategy can make some tasks ready,
+    /// wake them with [`Id::wake`] or [`Selector::wake_all`] (see [wakeups](Self#wakeups)).
     pub fn strategy_mut(&mut self) -> &mut S {
         &mut self.strategy
     }
 
-    /// Returns a new selector with the same state, but different strategy.
+    /// Converts this selector into one that uses a different strategy, keeping all the tasks.
+    ///
+    /// This is useful when your tasks implement [`Task`] for more than one strategy,
+    /// and you want to change the way they are polled,
+    /// e.g. switch from reading data to a graceful shutdown.
+    ///
+    /// Tasks that are waiting for a wakeup will not be polled with the new strategy
+    /// until they are woken. If they should be, call [`wake_all`](Self::wake_all)
+    /// (see the [custom task example](https://github.com/Razz4780/async-selector/blob/main/examples/custom.rs)).
+    ///
+    /// ```
+    /// use async_selector::{StreamSelector, task::strategy::StreamWithId};
+    /// use futures::StreamExt;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let mut selector = StreamSelector::default();
+    /// selector.push(futures::stream::repeat(1));
+    /// assert_eq!(selector.next().await, Some(1));
+    ///
+    /// // Same streams, but now each item comes with the ID of its stream.
+    /// let mut selector = selector.with_strategy(StreamWithId);
+    /// let (_id, item) = selector.next().await.unwrap();
+    /// assert_eq!(item, 1);
+    /// # }
+    /// ```
     pub fn with_strategy<S1>(self, strategy: S1) -> Selector<T, S1> {
         Selector {
             tasks: self.tasks,
@@ -184,27 +404,99 @@ impl<T, S> Selector<T, S> {
         }
     }
 
-    /// Returns an iterator over all tasks in the selector.
+    /// Returns an iterator over references to all tasks in the selector,
+    /// in the order in which they were pushed.
     ///
-    /// The tasks are visited in the insertion order.
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use async_selector::FutureSelector;
+    /// use tokio::time::sleep;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let mut timers = FutureSelector::default();
+    /// for secs in [3, 1, 2] {
+    ///     timers.push(sleep(Duration::from_secs(secs)));
+    /// }
+    ///
+    /// // Find the deadline of the timer that fires first.
+    /// let first = timers.iter().map(|timer| timer.deadline()).min().unwrap();
+    ///
+    /// // The timers are visited in the order in which they were pushed,
+    /// // so the 1 second timer is the second one.
+    /// assert_eq!(first, timers.iter().nth(1).unwrap().deadline());
+    /// # }
+    /// ```
     pub fn iter(&self) -> iter::Iter<'_, T> {
         iter::Iter(self.tasks.list.cursor())
     }
 
-    /// Returns an iterator that allows for modifying each task in the selector.
+    /// Returns an iterator over mutable references to all tasks in the selector,
+    /// in the order in which they were pushed.
     ///
-    /// The tasks are visited in the insertion order.
+    /// Keep in mind that the selector does not know that you modified the tasks.
+    /// If your change can make them ready, wake them (see [wakeups](Self#wakeups)).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use async_selector::FutureSelector;
+    /// use tokio::time::sleep;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let mut timers = FutureSelector::default();
+    /// for secs in [3, 1, 2] {
+    ///     timers.push(sleep(Duration::from_secs(secs)));
+    /// }
+    ///
+    /// // Postpone all timers by one second.
+    /// // This makes them fire later, so there is no need to wake them.
+    /// for mut timer in timers.iter_mut() {
+    ///     let deadline = timer.deadline();
+    ///     timer.get_pin_mut().reset(deadline + Duration::from_secs(1));
+    /// }
+    /// # }
+    /// ```
     pub fn iter_mut(&mut self) -> iter::IterMut<'_, T> {
         iter::IterMut(self.tasks.list.cursor_mut())
     }
 
-    /// Creates an iterator which uses a closure to determine if a task should be removed.
+    /// Returns an iterator that removes and yields the tasks
+    /// for which the given predicate returns `true`.
     ///
-    /// If the closure returns true, the task is removed from the selector and yielded.
-    /// The tasks are visited in the insertion order.
+    /// The tasks are visited in the order in which they were pushed.
+    /// The predicate receives a mutable reference to each task.
     ///
-    /// If the returned [`ExtractIf`] is not exhausted, e.g. because it is dropped without iterating or the iteration short-circuits,
-    /// then the remaining tasks will be retained.
+    /// The tasks are removed lazily, as you iterate.
+    /// If you drop the returned [`ExtractIf`] before it is exhausted,
+    /// the remaining tasks stay in the selector.
+    /// To simply drop the matching tasks, use [`retain`](Self::retain).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use async_selector::FutureSelector;
+    /// use tokio::time::{Instant, sleep};
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let mut timers = FutureSelector::default();
+    /// for secs in [3, 1, 2] {
+    ///     timers.push(sleep(Duration::from_secs(secs)));
+    /// }
+    ///
+    /// // Take out all timers that fire within 2 seconds.
+    /// let soon = Instant::now() + Duration::from_secs(2);
+    /// let removed = timers
+    ///     .extract_if(|timer| timer.deadline() <= soon)
+    ///     .collect::<Vec<_>>();
+    ///
+    /// assert_eq!(removed.len(), 2);
+    /// assert_eq!(timers.len(), 1);
+    /// # }
+    /// ```
     #[must_use = "ExtractIf does not remove any elements unless consumed"]
     pub fn extract_if<F>(&mut self, pred: F) -> ExtractIf<'_, T, F>
     where
@@ -216,10 +508,33 @@ impl<T, S> Selector<T, S> {
         }
     }
 
-    /// Retains only the tasks specified by the predicate.
+    /// Keeps only the tasks for which the given predicate returns `true`,
+    /// and drops the rest.
     ///
-    /// In other words, remove all tasks for which the predicate returns false.
-    /// The tasks are visited in the insertion order.
+    /// The tasks are visited in the order in which they were pushed.
+    /// The predicate receives a mutable reference to each task.
+    /// To get the removed tasks back, use [`extract_if`](Self::extract_if).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use async_selector::FutureSelector;
+    /// use tokio::time::{Instant, sleep};
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let mut timers = FutureSelector::default();
+    /// for secs in [3, 1, 2] {
+    ///     timers.push(sleep(Duration::from_secs(secs)));
+    /// }
+    ///
+    /// // Drop all timers that fire later than in 2 seconds.
+    /// let cutoff = Instant::now() + Duration::from_secs(2);
+    /// timers.retain(|timer| timer.deadline() <= cutoff);
+    ///
+    /// assert_eq!(timers.len(), 2);
+    /// # }
+    /// ```
     pub fn retain<F>(&mut self, mut pred: F)
     where
         F: for<'b> FnMut(BorrowedMut<'b, T>) -> bool,
@@ -227,7 +542,13 @@ impl<T, S> Selector<T, S> {
         for _ in self.extract_if(|borrowed| pred(borrowed).not()) {}
     }
 
-    /// Manually wakes all tasks in the selector.
+    /// Wakes all tasks in the selector,
+    /// so that each of them is polled the next time the selector is polled.
+    ///
+    /// Use this after a change that can make the tasks ready without waking them,
+    /// e.g. after switching the strategy with [`with_strategy`](Self::with_strategy)
+    /// (see [wakeups](Self#wakeups)).
+    /// To wake a single task, use [`Id::wake`].
     pub fn wake_all(&self) {
         let queue = self.tasks.queue.queue();
         self.iter().for_each(|task| unsafe {
@@ -244,6 +565,7 @@ impl<T, S> Selector<T, S> {
     }
 }
 
+/// Pushes all tasks from the iterator into the selector.
 impl<T, S> Extend<T> for Selector<T, S> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         for task in iter {
@@ -252,6 +574,7 @@ impl<T, S> Extend<T> for Selector<T, S> {
     }
 }
 
+/// Creates a selector with the default strategy, holding all tasks from the iterator.
 impl<T, S> FromIterator<T> for Selector<T, S>
 where
     S: Default,
@@ -263,6 +586,7 @@ where
     }
 }
 
+/// Removes all tasks from the selector, in the order in which they were pushed.
 impl<T, S> IntoIterator for Selector<T, S> {
     type IntoIter = iter::IntoIter<T>;
     type Item = Removed<T>;
@@ -290,6 +614,11 @@ impl<'a, T, S> IntoIterator for &'a mut Selector<T, S> {
     }
 }
 
+/// Polls the woken tasks, and yields the first [`Task::Output`] they produce.
+///
+/// Yields [`None`] when the selector is empty.
+/// This does not mean that the selector is done for good:
+/// you can push more tasks and keep polling it.
 impl<T, S> Stream for Selector<T, S>
 where
     T: Task<S>,
@@ -347,7 +676,7 @@ where
                         if output.is_some() {
                             return Poll::Ready(output);
                         }
-                    }
+                    },
 
                     Poll::Ready(ControlFlow::Break(val)) => {
                         let node = guard.remove_now();
@@ -355,11 +684,11 @@ where
                         if output.is_some() {
                             return Poll::Ready(output);
                         }
-                    }
+                    },
 
                     Poll::Pending => {
                         guard.forget();
-                    }
+                    },
                 }
 
                 if is_last {
@@ -409,6 +738,11 @@ where
     }
 }
 
+/// Returns a reference to the task with the given [`Id`].
+///
+/// # Panics
+///
+/// Panics if the selector does not hold the task. Use [`Selector::get`] to avoid that.
 impl<T, S> Index<&Id<T>> for Selector<T, S> {
     type Output = T;
 
@@ -417,6 +751,11 @@ impl<T, S> Index<&Id<T>> for Selector<T, S> {
     }
 }
 
+/// Returns a reference to the task with the given [`Id`].
+///
+/// # Panics
+///
+/// Panics if the selector does not hold the task. Use [`Selector::get`] to avoid that.
 impl<T, S> Index<Id<T>> for Selector<T, S> {
     type Output = T;
 
@@ -425,6 +764,13 @@ impl<T, S> Index<Id<T>> for Selector<T, S> {
     }
 }
 
+/// Returns a mutable reference to the task with the given [`Id`].
+///
+/// Only available when the task is [`Unpin`]. Otherwise, use [`Selector::get_mut`].
+///
+/// # Panics
+///
+/// Panics if the selector does not hold the task. Use [`Selector::get_mut`] to avoid that.
 impl<T, S> IndexMut<&Id<T>> for Selector<T, S>
 where
     T: Unpin,
@@ -437,6 +783,13 @@ where
     }
 }
 
+/// Returns a mutable reference to the task with the given [`Id`].
+///
+/// Only available when the task is [`Unpin`]. Otherwise, use [`Selector::get_mut`].
+///
+/// # Panics
+///
+/// Panics if the selector does not hold the task. Use [`Selector::get_mut`] to avoid that.
 impl<T, S> IndexMut<Id<T>> for Selector<T, S>
 where
     T: Unpin,

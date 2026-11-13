@@ -16,7 +16,7 @@ Allows for:
 * Polling multiple tasks concurrently on the same thread
 * Safe injection of mutable shared state into the polling logic,
   meaning that caller code can provide a custom polling function with a strongly typed context
-* O(1) task access and removal with unique IDs
+* Fast O(1) task access and removal with unique IDs
 
 The main struct is `Selector`, which works with any `Task` implementor.
 For convenience, this crate exposes multiple specializations of the selector,

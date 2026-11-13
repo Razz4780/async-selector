@@ -17,7 +17,29 @@ futures = "0.3"
 static_assertions = "1"
 
 [dev-dependencies]
+criterion = "0.7"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+[[bench]]
+name = "insert"
+harness = false
+
+[[bench]]
+name = "poll"
+harness = false
+
+[[bench]]
+name = "wakeups"
+harness = false
+
+[[bench]]
+name = "removal"
+harness = false
+
+[[bench]]
+name = "parallel"
+harness = false
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"

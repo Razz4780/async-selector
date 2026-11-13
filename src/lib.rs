@@ -10,13 +10,13 @@
 //!
 //! Inspired by [`FuturesUnordered`](futures::stream::FuturesUnordered), but more flexible and optimized.
 //! Provides optimal performance when polling a large number of tasks
-//! (see [example](https://github.com/Razz4780/async-selector/blob/main/examples/speed.rs)).
+//! (see [benchmarks](https://github.com/Razz4780/async-selector/tree/main/benches)).
 //!
 //! Allows for:
 //! * Polling multiple tasks concurrently on the same thread
 //! * Safe injection of mutable shared state into the polling logic,
 //!   meaning that caller code can provide a custom polling function with a strongly typed context
-//! * O(1) task access and removal with unique IDs
+//! * Fast O(1) task access and removal with unique IDs
 //!
 //! The main struct is [`Selector`], which works with any [`Task`](crate::task::Task) implementor.
 //! For convenience, this crate exposes multiple specializations of the selector,
@@ -80,28 +80,16 @@
 //! 1. Reduced the number of CAS instructions
 //! 2. Removed repeated memory allocations when polling [`Stream`](futures::Stream)s
 //!
-//! [Here](https://github.com/Razz4780/async-selector/tree/main/examples/speed.rs) lives the source code
-//! of an example used to compare performance. It is not a proper benchmark,
-//! but strongly suggests that this implementation is at least as fast as
-//! [`FuturesUnordered`](futures::stream::FuturesUnordered).
-//!
-//! The results below were obtained with:
-//! * rustc 1.96.0
-//! * 13th Gen Intel(R) Core(TM) i9-13900HX
-//! * Tokio runtime with 32 worker threads
-//! * `cargo run --example speed --profile release`
-//!
-//! **Scenario 1**: concurrently drain 32 instances, each draining 1k streams, each stream producing 16k values (yielding once before producing each value)
-//!
-//! * [`StreamSelector`] - 1.078ms
-//! * [`SelectAll`](futures::stream::SelectAll) - 3.956s
-//!
-//! **Scenario 2**: concurrently drain 32 instances, each resolving 1k futures, each future yielding 16k times
-//!
-//! * [`FutureSelector`] - 859.562ms
-//! * [`FuturesUnordered`](futures::stream::FuturesUnordered) - 2.748s
+//! Benchmark results are available in the
+//! [README](https://github.com/Razz4780/async-selector/blob/main/README.md#performance).
 
 #![deny(unused_crate_dependencies)]
+
+// Dev-dependencies used only by benchmarks and integration tests.
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use tokio_stream as _;
 
 use crate::{selector::Selector, task::strategy};
 

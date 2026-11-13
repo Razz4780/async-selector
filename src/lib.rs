@@ -85,6 +85,12 @@
 
 #![deny(unused_crate_dependencies)]
 
+// Dev-dependencies used only by benchmarks and integration tests.
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use tokio_stream as _;
+
 use crate::{selector::Selector, task::strategy};
 
 mod list;

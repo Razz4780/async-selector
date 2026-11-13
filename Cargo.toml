@@ -12,6 +12,10 @@ keywords = ["async", "concurrency"]
 categories = ["asynchronous", "concurrency"]
 rust-version = "1.85.1"
 
+# The benches use criterion's harness.
+[lib]
+bench = false
+
 [dependencies]
 futures = "0.3"
 static_assertions = "1"

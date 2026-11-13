@@ -722,6 +722,7 @@ mod test {
             use std::sync::atomic::Ordering;
 
             let take = |feed: &Feed| {
+                #[allow(deprecated)] // AtomicUsize::fetch_update deprecated since 1.100.0
                 feed.ready
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .is_ok()

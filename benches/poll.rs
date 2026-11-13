@@ -1,4 +1,7 @@
 //! Single-threaded polling throughput.
+//!
+//! [`StreamMap`] is included as the alternative that supports keyed access.
+//! It holds futures wrapped with [`stream::once`].
 
 mod common;
 
@@ -15,14 +18,20 @@ use criterion::{
 };
 use futures::{
     Stream,
-    stream::{FuturesUnordered, SelectAll},
+    stream::{self, FuturesUnordered, SelectAll},
 };
+use tokio_stream::StreamMap;
 
 /// Benchmarks draining a stream built with `build`.
 ///
 /// Building and dropping the stream is not measured.
-fn bench_drain<S, F>(group: &mut BenchmarkGroup<'_, WallTime>, name: &str, n: usize, build: F)
-where
+fn bench_drain<S, F>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    name: &str,
+    n: usize,
+    expected_items: usize,
+    build: F,
+) where
     S: Stream + Unpin,
     F: Fn() -> S,
 {
@@ -31,11 +40,31 @@ where
         b.iter_batched(
             &build,
             |mut stream| {
-                black_box(driver.count_to_end(&mut stream));
+                assert_eq!(driver.count_to_end(&mut stream), expected_items);
                 stream
             },
             BatchSize::LargeInput,
         )
+    });
+}
+
+/// Benchmarks building a stream with `build` and draining it.
+fn bench_build_and_drain<S, F>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    name: &str,
+    n: usize,
+    expected_items: usize,
+    build: F,
+) where
+    S: Stream + Unpin,
+    F: Fn() -> S,
+{
+    let driver = Driver::default();
+    group.bench_function(BenchmarkId::new(name, n), |b| {
+        b.iter(|| {
+            let mut stream = build();
+            assert_eq!(driver.count_to_end(&mut stream), expected_items);
+        })
     });
 }
 
@@ -47,33 +76,22 @@ fn ready_futures(c: &mut Criterion) {
 
     for n in SIZES {
         group.throughput(Throughput::Elements(n as u64));
-        let driver = Driver::default();
+        let futures = || (0..n).map(std::future::ready);
 
-        group.bench_function(BenchmarkId::new("FutureSelector", n), |b| {
-            b.iter(|| {
-                let mut selector = (0..n)
-                    .map(std::future::ready)
-                    .collect::<FutureSelector<_>>();
-                driver.count_to_end(&mut selector)
-            })
+        bench_build_and_drain(&mut group, "FutureSelector", n, n, || {
+            futures().collect::<FutureSelector<_>>()
         });
-
-        group.bench_function(BenchmarkId::new("FutureReclaimSelector", n), |b| {
-            b.iter(|| {
-                let mut selector = (0..n)
-                    .map(std::future::ready)
-                    .collect::<FutureReclaimSelector<_>>();
-                driver.count_to_end(&mut selector)
-            })
+        bench_build_and_drain(&mut group, "FutureReclaimSelector", n, n, || {
+            futures().collect::<FutureReclaimSelector<_>>()
         });
-
-        group.bench_function(BenchmarkId::new("FuturesUnordered", n), |b| {
-            b.iter(|| {
-                let mut selector = (0..n)
-                    .map(std::future::ready)
-                    .collect::<FuturesUnordered<_>>();
-                driver.count_to_end(&mut selector)
-            })
+        bench_build_and_drain(&mut group, "FuturesUnordered", n, n, || {
+            futures().collect::<FuturesUnordered<_>>()
+        });
+        bench_build_and_drain(&mut group, "StreamMap", n, n, || {
+            futures()
+                .map(stream::once)
+                .enumerate()
+                .collect::<StreamMap<_, _>>()
         });
     }
 
@@ -90,17 +108,29 @@ fn ready_streams(c: &mut Criterion) {
         group.throughput(Throughput::Elements((n * ITEMS_PER_TASK) as u64));
         let streams = || (0..n).map(|_| ReadyStream::new(ITEMS_PER_TASK));
 
-        bench_drain(&mut group, "StreamSelector", n, || {
+        bench_drain(&mut group, "StreamSelector", n, n * ITEMS_PER_TASK, || {
             streams().collect::<StreamSelector<_>>()
         });
-        bench_drain(&mut group, "StreamWithIdSelector", n, || {
-            streams().collect::<StreamWithIdSelector<_>>()
-        });
-        bench_drain(&mut group, "StreamReclaimSelector", n, || {
-            streams().collect::<StreamReclaimSelector<_>>()
-        });
-        bench_drain(&mut group, "SelectAll", n, || {
+        bench_drain(
+            &mut group,
+            "StreamWithIdSelector",
+            n,
+            n * ITEMS_PER_TASK,
+            || streams().collect::<StreamWithIdSelector<_>>(),
+        );
+        bench_drain(
+            &mut group,
+            "StreamReclaimSelector",
+            n,
+            // One more item for each stream: the exhausted stream itself.
+            n * (ITEMS_PER_TASK + 1),
+            || streams().collect::<StreamReclaimSelector<_>>(),
+        );
+        bench_drain(&mut group, "SelectAll", n, n * ITEMS_PER_TASK, || {
             streams().collect::<SelectAll<_>>()
+        });
+        bench_drain(&mut group, "StreamMap", n, n * ITEMS_PER_TASK, || {
+            streams().enumerate().collect::<StreamMap<_, _>>()
         });
     }
 
@@ -118,11 +148,14 @@ fn yield_streams(c: &mut Criterion) {
         group.throughput(Throughput::Elements((n * ITEMS_PER_TASK) as u64));
         let streams = || (0..n).map(|_| YieldStream::new(ITEMS_PER_TASK));
 
-        bench_drain(&mut group, "StreamSelector", n, || {
+        bench_drain(&mut group, "StreamSelector", n, n * ITEMS_PER_TASK, || {
             streams().collect::<StreamSelector<_>>()
         });
-        bench_drain(&mut group, "SelectAll", n, || {
+        bench_drain(&mut group, "SelectAll", n, n * ITEMS_PER_TASK, || {
             streams().collect::<SelectAll<_>>()
+        });
+        bench_drain(&mut group, "StreamMap", n, n * ITEMS_PER_TASK, || {
+            streams().enumerate().collect::<StreamMap<_, _>>()
         });
     }
 
@@ -139,11 +172,17 @@ fn yield_futures(c: &mut Criterion) {
         group.throughput(Throughput::Elements((n * ITEMS_PER_TASK) as u64));
         let futures = || (0..n).map(|_| YieldFuture::new(ITEMS_PER_TASK));
 
-        bench_drain(&mut group, "FutureSelector", n, || {
+        bench_drain(&mut group, "FutureSelector", n, n, || {
             futures().collect::<FutureSelector<_>>()
         });
-        bench_drain(&mut group, "FuturesUnordered", n, || {
+        bench_drain(&mut group, "FuturesUnordered", n, n, || {
             futures().collect::<FuturesUnordered<_>>()
+        });
+        bench_drain(&mut group, "StreamMap", n, n, || {
+            futures()
+                .map(stream::once)
+                .enumerate()
+                .collect::<StreamMap<_, _>>()
         });
     }
 
@@ -154,6 +193,8 @@ fn yield_futures(c: &mut Criterion) {
 /// until `16 * n` futures complete.
 ///
 /// Models a server that handles a stream of short requests.
+///
+/// [`StreamMap`] insertion is O(n), so it is only benchmarked with smaller sizes.
 fn churn(c: &mut Criterion) {
     const YIELDS: usize = 4;
     const ROUNDS: usize = 16;
@@ -163,54 +204,81 @@ fn churn(c: &mut Criterion) {
     for n in SIZES {
         let total = n * ROUNDS;
         group.throughput(Throughput::Elements(total as u64));
-        let driver = Driver::default();
+        let future = || YieldFuture::new(YIELDS);
 
-        group.bench_function(BenchmarkId::new("FutureSelector", n), |b| {
-            b.iter_batched(
+        bench_churn(
+            &mut group,
+            "FutureSelector",
+            n,
+            total,
+            || (0..n).map(|_| future()).collect::<FutureSelector<_>>(),
+            |selector, _| {
+                selector.push(future());
+            },
+        );
+        bench_churn(
+            &mut group,
+            "FuturesUnordered",
+            n,
+            total,
+            || (0..n).map(|_| future()).collect::<FuturesUnordered<_>>(),
+            |selector, _| selector.push(future()),
+        );
+        if n <= 1024 {
+            bench_churn(
+                &mut group,
+                "StreamMap",
+                n,
+                total,
                 || {
                     (0..n)
-                        .map(|_| YieldFuture::new(YIELDS))
-                        .collect::<FutureSelector<_>>()
+                        .map(|key| (key, stream::once(future())))
+                        .collect::<StreamMap<_, _>>()
                 },
-                |mut selector| {
-                    let mut pushed = n;
-                    while let Some(Some(output)) = driver.next(&mut selector) {
-                        black_box(output);
-                        if pushed < total {
-                            selector.push(YieldFuture::new(YIELDS));
-                            pushed += 1;
-                        }
-                    }
-                    selector
+                |map, key| {
+                    map.insert(key, stream::once(future()));
                 },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(BenchmarkId::new("FuturesUnordered", n), |b| {
-            b.iter_batched(
-                || {
-                    (0..n)
-                        .map(|_| YieldFuture::new(YIELDS))
-                        .collect::<FuturesUnordered<_>>()
-                },
-                |mut selector| {
-                    let mut pushed = n;
-                    while let Some(Some(output)) = driver.next(&mut selector) {
-                        black_box(output);
-                        if pushed < total {
-                            selector.push(YieldFuture::new(YIELDS));
-                            pushed += 1;
-                        }
-                    }
-                    selector
-                },
-                BatchSize::LargeInput,
-            )
-        });
+            );
+        }
     }
 
     group.finish();
+}
+
+/// Benchmarks [`churn`] for one selector.
+///
+/// `push` receives a unique number for the new task, which can be used as a key.
+fn bench_churn<S, B, P>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    name: &str,
+    n: usize,
+    total: usize,
+    build: B,
+    push: P,
+) where
+    S: Stream + Unpin,
+    B: Fn() -> S,
+    P: Fn(&mut S, usize),
+{
+    let driver = Driver::default();
+    group.bench_function(BenchmarkId::new(name, n), |b| {
+        b.iter_batched(
+            &build,
+            |mut selector| {
+                let mut pushed = n;
+                while let Some(Some(output)) = driver.next(&mut selector) {
+                    black_box(output);
+                    if pushed < total {
+                        push(&mut selector, pushed);
+                        pushed += 1;
+                    }
+                }
+                assert_eq!(pushed, total);
+                selector
+            },
+            BatchSize::LargeInput,
+        )
+    });
 }
 
 criterion_group! {

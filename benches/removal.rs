@@ -6,8 +6,8 @@ use async_selector::StreamSelector;
 use common::{Driver, shuffled};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::{
-    future::{AbortHandle, abortable},
-    stream::{self, FuturesUnordered},
+    future::AbortHandle,
+    stream::{self, SelectAll},
 };
 use tokio_stream::StreamMap;
 
@@ -65,15 +65,15 @@ fn remove_all(c: &mut Criterion) {
             )
         });
 
-        // The "remove by key" pattern for `FuturesUnordered`: abort the future through its handle,
-        // and let the `FuturesUnordered` drop it on the next poll.
-        group.bench_function(BenchmarkId::new("FuturesUnordered+Abortable", n), |b| {
+        // The "remove by key" pattern for `SelectAll`: abort the stream through its handle,
+        // and let the `SelectAll` drop it on the next poll.
+        group.bench_function(BenchmarkId::new("SelectAll+Abortable", n), |b| {
             b.iter_batched(
                 || {
-                    let (handles, mut selector): (Vec<AbortHandle>, FuturesUnordered<_>) = (0..n)
+                    let (handles, mut selector): (Vec<AbortHandle>, SelectAll<_>) = (0..n)
                         .map(|_| {
-                            let (future, handle) = abortable(futures::future::pending::<usize>());
-                            (handle, future)
+                            let (stream, handle) = stream::abortable(stream::pending::<usize>());
+                            (handle, stream)
                         })
                         .unzip();
                     assert!(!driver.drain(&mut selector, |_| {}));
@@ -87,7 +87,7 @@ fn remove_all(c: &mut Criterion) {
                     for handle in &handles {
                         handle.abort();
                     }
-                    assert_eq!(driver.count_to_end(&mut selector), n);
+                    assert_eq!(driver.count_to_end(&mut selector), 0);
                     (selector, handles)
                 },
                 BatchSize::LargeInput,

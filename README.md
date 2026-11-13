@@ -70,22 +70,28 @@ However, some optimizations were made:
 
 The crate comes with a set of [criterion](https://docs.rs/criterion) benchmarks, which live
 [here](https://github.com/Razz4780/async-selector/tree/main/benches).
-They compare the selectors with their counterparts from `futures`
-(and `tokio-stream` where keyed removal is available). Run them with `cargo bench`.
+They compare the selectors with `FuturesUnordered`/`SelectAll` from `futures`,
+and with `StreamMap` from `tokio-stream`. Run them with `cargo bench`.
 
-Selected results (median times), obtained with:
+Selected results, obtained with:
 * rustc 1.100.0
 * 13th Gen Intel(R) Core(TM) i9-13900HX (32 threads)
 * Linux, glibc allocator
 
-| Benchmark | `async-selector` | Alternative | Speedup |
+`StreamMap` holds futures wrapped with `futures::stream::once`.
+
+| Benchmark | `async-selector` | `futures` | `tokio-stream` |
 |---|---|---|---|
-| `ready_streams`: 1k streams, 64 immediately ready items each | `StreamSelector` 1.14 ms | `SelectAll` 3.53 ms | 3.1x |
-| `yield_streams`: 1k streams, 64 items each, self-wake before each item | `StreamSelector` 2.56 ms | `SelectAll` 6.84 ms | 2.7x |
-| `yield_futures`: 1k futures, each self-waking 64 times | `FutureSelector` 1.54 ms | `FuturesUnordered` 3.29 ms | 2.1x |
-| `ready_futures`: push and resolve 1k ready futures | `FutureSelector` 51.9 µs | `FuturesUnordered` 71.3 µs | 1.4x |
-| `churn`: 1k short-lived futures in flight, 16k completions | `FutureSelector` 2.05 ms | `FuturesUnordered` 3.91 ms | 1.9x |
-| `sparse_wakeups`: wake and drain 1 of 16k idle streams | `StreamSelector` 107 ns | `SelectAll` 192 ns | 1.8x |
-| `cross_thread`: 4 threads wake 1k streams, drained concurrently | `StreamSelector` 113 µs | `SelectAll` 242 µs | 2.1x |
-| `parallel/ready_streams`: like `ready_streams`, 32 instances on 32 threads (time per instance) | `StreamSelector` 1.73 ms | `SelectAll` 6.04 ms | 3.5x |
-| `remove_all`: remove 4k idle streams in random order | `StreamSelector` 34.9 µs | `StreamMap` (tokio-stream) 779 µs | 22x |
+| `ready_streams`: 1k streams, 64 immediately ready items each | `StreamSelector` 1.14 ms | `SelectAll` 3.53 ms (3.1x) | `StreamMap` 143 µs (0.13x) |
+| `yield_streams`: 1k streams, 64 items each, self-wake before each item | `StreamSelector` 2.58 ms | `SelectAll` 6.71 ms (2.6x) | `StreamMap` 787 µs (0.31x) |
+| `yield_futures`: 1k futures, each self-waking 64 times | `FutureSelector` 1.44 ms | `FuturesUnordered` 3.14 ms (2.2x) | `StreamMap` 205 µs (0.14x) |
+| `ready_futures`: push and resolve 1k ready futures | `FutureSelector` 50.9 µs | `FuturesUnordered` 70.5 µs (1.4x) | `StreamMap` 117 µs (2.3x) |
+| `churn`: 1k short-lived futures in flight, 16k completions | `FutureSelector` 2.07 ms | `FuturesUnordered` 3.90 ms (1.9x) | `StreamMap` 4.33 ms (2.1x) |
+| `sparse_wakeups`: wake and drain 1 of 16k idle streams | `StreamSelector` 108 ns | `SelectAll` 191 ns (1.8x) | `StreamMap` 612 µs (5600x) |
+| `cross_thread`: 4 threads wake 1k streams, drained concurrently | `StreamSelector` 114 µs | `SelectAll` 230 µs (2.0x) | `StreamMap` 411 µs (3.6x) |
+| `parallel/ready_streams`: like `ready_streams`, 32 instances on 32 threads (time per instance) | `StreamSelector` 1.62 ms | `SelectAll` 6.31 ms (3.9x) | `StreamMap` 287 µs (0.18x) |
+| `remove_all`: remove 4k idle streams in random order | `StreamSelector` 34.8 µs | `SelectAll` + `Abortable` 333 µs (9.6x) | `StreamMap` 777 µs (22x) |
+
+`StreamMap` keeps its streams in a `Vec`, and polls them one by one on every wakeup.
+This makes it the fastest option when all tasks are ready all the time,
+but it comes with overhead on each wakeup, insertion and removal.

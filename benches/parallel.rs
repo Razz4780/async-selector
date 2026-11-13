@@ -10,7 +10,6 @@
 mod common;
 
 use std::{
-    hint::black_box,
     sync::Barrier,
     thread,
     time::{Duration, Instant},
@@ -24,8 +23,9 @@ use criterion::{
 };
 use futures::{
     Stream,
-    stream::{FuturesUnordered, SelectAll},
+    stream::{self, FuturesUnordered, SelectAll},
 };
+use tokio_stream::StreamMap;
 
 /// Number of tasks in one selector instance.
 const TASKS: usize = 1024;
@@ -48,7 +48,7 @@ fn thread_counts() -> Vec<usize> {
 /// and returns the average time spent draining by a single thread.
 ///
 /// Building and dropping the instances is not measured.
-fn run_parallel<S, F>(threads: usize, iters: u64, build: &F) -> Duration
+fn run_parallel<S, F>(threads: usize, iters: u64, expected_items: usize, build: &F) -> Duration
 where
     S: Stream + Unpin,
     F: Fn() -> S + Sync,
@@ -64,8 +64,9 @@ where
                     for _ in 0..iters {
                         let mut stream = build();
                         let start = Instant::now();
-                        black_box(driver.count_to_end(&mut stream));
+                        let items = driver.count_to_end(&mut stream);
                         elapsed += start.elapsed();
+                        assert_eq!(items, expected_items);
                         drop(stream);
                     }
                     elapsed
@@ -77,14 +78,18 @@ where
     total / u32::try_from(threads).unwrap()
 }
 
-fn bench_parallel<S, F>(group: &mut BenchmarkGroup<'_, WallTime>, name: &str, build: F)
-where
+fn bench_parallel<S, F>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    name: &str,
+    expected_items: usize,
+    build: F,
+) where
     S: Stream + Unpin,
     F: Fn() -> S + Sync,
 {
     for threads in thread_counts() {
         group.bench_function(BenchmarkId::new(name, threads), |b| {
-            b.iter_custom(|iters| run_parallel(threads, iters, &build))
+            b.iter_custom(|iters| run_parallel(threads, iters, expected_items, &build))
         });
     }
 }
@@ -97,11 +102,14 @@ fn ready_streams(c: &mut Criterion) {
     group.throughput(Throughput::Elements((TASKS * ITEMS_PER_TASK) as u64));
     let streams = || (0..TASKS).map(|_| ReadyStream::new(ITEMS_PER_TASK));
 
-    bench_parallel(&mut group, "StreamSelector", || {
+    bench_parallel(&mut group, "StreamSelector", TASKS * ITEMS_PER_TASK, || {
         streams().collect::<StreamSelector<_>>()
     });
-    bench_parallel(&mut group, "SelectAll", || {
+    bench_parallel(&mut group, "SelectAll", TASKS * ITEMS_PER_TASK, || {
         streams().collect::<SelectAll<_>>()
+    });
+    bench_parallel(&mut group, "StreamMap", TASKS * ITEMS_PER_TASK, || {
+        streams().enumerate().collect::<StreamMap<_, _>>()
     });
 
     group.finish();
@@ -115,11 +123,14 @@ fn yield_streams(c: &mut Criterion) {
     group.throughput(Throughput::Elements((TASKS * ITEMS_PER_TASK) as u64));
     let streams = || (0..TASKS).map(|_| YieldStream::new(ITEMS_PER_TASK));
 
-    bench_parallel(&mut group, "StreamSelector", || {
+    bench_parallel(&mut group, "StreamSelector", TASKS * ITEMS_PER_TASK, || {
         streams().collect::<StreamSelector<_>>()
     });
-    bench_parallel(&mut group, "SelectAll", || {
+    bench_parallel(&mut group, "SelectAll", TASKS * ITEMS_PER_TASK, || {
         streams().collect::<SelectAll<_>>()
+    });
+    bench_parallel(&mut group, "StreamMap", TASKS * ITEMS_PER_TASK, || {
+        streams().enumerate().collect::<StreamMap<_, _>>()
     });
 
     group.finish();
@@ -127,17 +138,23 @@ fn yield_streams(c: &mut Criterion) {
 
 /// Futures that wake themselves multiple times before resolving.
 ///
-/// Neither selector allocates in the hot path. This is the control group.
+/// None of the selectors allocates in the hot path. This is the control group.
 fn yield_futures(c: &mut Criterion) {
     let mut group = c.benchmark_group("parallel/yield_futures");
     group.throughput(Throughput::Elements((TASKS * ITEMS_PER_TASK) as u64));
     let futures = || (0..TASKS).map(|_| YieldFuture::new(ITEMS_PER_TASK));
 
-    bench_parallel(&mut group, "FutureSelector", || {
+    bench_parallel(&mut group, "FutureSelector", TASKS, || {
         futures().collect::<FutureSelector<_>>()
     });
-    bench_parallel(&mut group, "FuturesUnordered", || {
+    bench_parallel(&mut group, "FuturesUnordered", TASKS, || {
         futures().collect::<FuturesUnordered<_>>()
+    });
+    bench_parallel(&mut group, "StreamMap", TASKS, || {
+        futures()
+            .map(stream::once)
+            .enumerate()
+            .collect::<StreamMap<_, _>>()
     });
 
     group.finish();

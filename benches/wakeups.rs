@@ -14,11 +14,13 @@ use std::{
 use async_selector::StreamSelector;
 use common::{Driver, SIZES, Signal, SignalStream, shuffled};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use futures::{Stream, stream::SelectAll};
+use futures::{Stream, StreamExt, stream::SelectAll};
+use tokio_stream::StreamMap;
 
 /// Hold `n` idle streams, wake `k` of them, and drain the selector.
 ///
 /// The cost should depend only on `k`, not on `n`.
+/// This does not hold for [`StreamMap`], which polls all streams on every wakeup.
 fn sparse_wakeups(c: &mut Criterion) {
     for k in [1, 16] {
         let mut group = c.benchmark_group(format!("sparse_wakeups/k={k}"));
@@ -31,6 +33,7 @@ fn sparse_wakeups(c: &mut Criterion) {
             bench_sparse(&mut group, "SelectAll", n, k, |streams| {
                 streams.collect::<SelectAll<_>>()
             });
+            bench_sparse(&mut group, "StreamMap", n, k, stream_map);
         }
 
         group.finish();
@@ -107,9 +110,25 @@ fn cross_thread(c: &mut Criterion) {
                 })
             })
         });
+
+        group.bench_function(BenchmarkId::new("StreamMap", producers), |b| {
+            b.iter_custom(|iters| run_cross_thread(iters, producers, STREAMS, stream_map))
+        });
     }
 
     group.finish();
+}
+
+/// Builds a [`StreamMap`] from the given streams, keyed with consecutive numbers.
+///
+/// Keys are dropped from the produced items, to match the item type of the other selectors.
+fn stream_map(
+    streams: std::vec::IntoIter<SignalStream>,
+) -> impl Stream<Item = usize> + Unpin + use<> {
+    streams
+        .enumerate()
+        .collect::<StreamMap<_, _>>()
+        .map(|(_, count)| count)
 }
 
 fn run_cross_thread<S, F>(iters: u64, producers: usize, streams: usize, build: F) -> Duration

@@ -78,9 +78,7 @@ Selected results, obtained with:
 * 13th Gen Intel(R) Core(TM) i9-13900HX (32 threads)
 * Linux, glibc allocator
 
-`StreamMap` holds futures wrapped with `futures::stream::once`.
-
-| Benchmark | `async-selector` | `futures` | `tokio-stream` |
+| Benchmark | `async-selector` | `futures 0.3.34` | `tokio-stream 0.1.19`<sup>1, 2</sup> |
 |---|---|---|---|
 | `ready_streams`: 1k streams, 64 immediately ready items each | `StreamSelector` 1.14 ms | `SelectAll` 3.53 ms (3.1x) | `StreamMap` 143 µs (0.13x) |
 | `yield_streams`: 1k streams, 64 items each, self-wake before each item | `StreamSelector` 2.58 ms | `SelectAll` 6.71 ms (2.6x) | `StreamMap` 787 µs (0.31x) |
@@ -92,6 +90,5 @@ Selected results, obtained with:
 | `parallel/ready_streams`: like `ready_streams`, 32 instances on 32 threads (time per instance) | `StreamSelector` 1.62 ms | `SelectAll` 6.31 ms (3.9x) | `StreamMap` 287 µs (0.18x) |
 | `remove_all`: remove 4k idle streams in random order | `StreamSelector` 34.8 µs | `SelectAll` + `Abortable` 333 µs (9.6x) | `StreamMap` 777 µs (22x) |
 
-`StreamMap` keeps its streams in a `Vec`, and polls them one by one on every wakeup.
-This makes it the fastest option when all tasks are ready all the time,
-but it comes with overhead on each wakeup, insertion and removal.
+1. When holding futures, `StreamMap` wraps them with `futures::stream::once`.
+2. `StreamMap` keeps its streams in a `Vec`, and polls them one by one on every wakeup. This makes it the fastest option when all tasks are ready all the time, but it comes with overhead on each wakeup, insertion and removal. The overhead grows with the size of the map.

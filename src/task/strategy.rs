@@ -1,5 +1,10 @@
-//! Set of strategies that provide blanket [`Task`] implementations
-//! for implementors of common traits: [`Future`], [`Stream`] and [`TryStream`].
+//! Ready-to-go strategies, which implement [`Task`] for all [`Future`]s, [`Stream`]s,
+//! and [`TryStream`]s.
+//!
+//! The strategy decides what the selector yields, and what happens to finished tasks.
+//! The crate root exposes a type alias for each strategy in this module,
+//! e.g. [`StreamSelector<S>`](crate::StreamSelector) is `Selector<S, StreamBasic>`.
+//! See [choosing a selector](crate#choosing-a-selector) for an overview.
 
 use std::{
     convert::Infallible,
@@ -15,29 +20,29 @@ use crate::{
     task::Task,
 };
 
-/// Yield future's output.
+/// Strategy for [`Future`]s, which yields their outputs.
 ///
-/// Enables [`Task`] implementation on any type that implements [`Future`].
+/// Each future is polled until it resolves.
+/// Then the selector drops the future, and yields its output.
 ///
-/// The future will be polled until it resolves.
-/// After that, the [`Selector`](crate::Selector) will
-/// silently drop it and yield the output.
+/// Used by [`FutureSelector`](crate::FutureSelector).
 ///
 /// ```
-/// # use async_selector::{
-/// #     selector::Selector,
-/// #     task::strategy::FutureBasic,
-/// # };
-/// # use futures::StreamExt;
-/// # #[tokio::main]
+/// use async_selector::FutureSelector;
+/// use futures::StreamExt;
+///
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
-/// let mut selector = (0..4)
+/// // Same as `Selector<_, FutureBasic>`.
+/// let mut selector = (0..3)
 ///     .map(std::future::ready)
-///     .collect::<Selector<_, FutureBasic>>();
-/// for i in 0..4 {
-///     let j: i32 = selector.next().await.unwrap();
-///     assert_eq!(j, i);
-/// }
+///     .collect::<FutureSelector<_>>();
+///
+/// // All futures are ready, so they resolve in the order in which they were pushed.
+/// let outputs = (&mut selector).collect::<Vec<_>>().await;
+/// assert_eq!(outputs, [0, 1, 2]);
+///
+/// // Resolved futures are dropped.
 /// assert!(selector.is_empty());
 /// # }
 /// ```
@@ -74,30 +79,32 @@ impl<F: Future> Task<FutureBasic> for F {
     }
 }
 
-/// Yield future's output and the future itself.
+/// Strategy for [`Future`]s, which yields their outputs together with the resolved futures.
 ///
-/// Enables [`Task`] implementation on any type that implements [`Future`].
+/// Each future is polled until it resolves.
+/// Then the selector removes the future, and yields a `(Removed<F>, F::Output)` pair.
+/// Useful when the future holds some state that you want back after it resolves.
 ///
-/// The future will be polled until it resolves.
-/// After that, the [`Selector`](crate::Selector) will
-/// yield the output and the future itself.
+/// Used by [`FutureReclaimSelector`](crate::FutureReclaimSelector).
 ///
 /// ```
-/// # use async_selector::{
-/// #     selector::{Removed, Selector},
-/// #     task::strategy::FutureReclaim,
-/// # };
-/// # use futures::{future::{FusedFuture, Ready}, StreamExt};
-/// # #[tokio::main]
+/// use async_selector::FutureReclaimSelector;
+/// use futures::{StreamExt, future::FusedFuture};
+///
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
-/// let mut selector = (0..4)
+/// // Same as `Selector<_, FutureReclaim>`.
+/// let mut selector = (0..3)
 ///     .map(futures::future::ready)
-///     .collect::<Selector<_, FutureReclaim>>();
-/// for i in 0..4 {
-///     let item: (Removed<Ready<i32>>, i32) = selector.next().await.unwrap();
-///     assert!(item.0.is_terminated());
-///     assert_eq!(item.1, i);
+///     .collect::<FutureReclaimSelector<_>>();
+///
+/// for i in 0..3 {
+///     let (future, output) = selector.next().await.unwrap();
+///     assert_eq!(output, i);
+///     // We get the future back. It has already resolved.
+///     assert!(future.is_terminated());
 /// }
+///
 /// assert!(selector.is_empty());
 /// # }
 /// ```
@@ -134,30 +141,31 @@ impl<F: Future> Task<FutureReclaim> for F {
     }
 }
 
-/// Yield stream's items.
+/// Strategy for [`Stream`]s, which yields their items.
 ///
-/// Enables [`Task`] implementation on any type that implements [`Stream`].
+/// Each stream is polled until it is exhausted.
+/// The selector yields all of its items, and then silently drops it.
 ///
-/// The stream will be polled for items until it is exhausted.
-/// [`Selector`](crate::Selector) will yield all items.
-/// After that, the [`Selector`](crate::Selector) will silently drop the stream.
+/// Used by [`StreamSelector`](crate::StreamSelector).
 ///
 /// ```
-/// # use async_selector::{
-/// #     selector::Selector,
-/// #     task::strategy::StreamBasic,
-/// # };
-/// # use futures::StreamExt;
-/// # #[tokio::main]
+/// use async_selector::StreamSelector;
+/// use futures::StreamExt;
+///
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
-/// let mut selector = (0..4)
-///     .map(|i| futures::stream::repeat(i).take(2))
-///     .collect::<Selector<_, StreamBasic>>();
-/// for i in 0..8 {
-///     let j: i32 = selector.next().await.unwrap();
-///     assert_eq!(j, i % 4);
-/// }
-/// assert!(selector.next().await.is_none());
+/// // Same as `Selector<_, StreamBasic>`.
+/// let mut selector = StreamSelector::default();
+///
+/// // Two streams, each with two items.
+/// selector.push(futures::stream::iter(["a1", "a2"]));
+/// selector.push(futures::stream::iter(["b1", "b2"]));
+///
+/// // Ready streams take turns.
+/// let items = (&mut selector).collect::<Vec<_>>().await;
+/// assert_eq!(items, ["a1", "b1", "a2", "b2"]);
+///
+/// // Exhausted streams are dropped.
 /// assert!(selector.is_empty());
 /// # }
 /// ```
@@ -197,31 +205,37 @@ impl<S: Stream> Task<StreamBasic> for S {
     }
 }
 
-/// Yield stream's items annotated with stream [`Id`].
+/// Strategy for [`Stream`]s, which yields their items
+/// paired with the [`Id`] of the stream that produced them.
 ///
-/// Enables [`Task`] implementation on any type that implements [`Stream`].
+/// Each stream is polled until it is exhausted.
+/// The selector yields all of its items as `(Id<S>, S::Item)` pairs, and then silently drops it.
 ///
-/// The stream will be polled for items until it is exhausted.
-/// [`Selector`](crate::Selector) will yield all items, attaching stream's task [`Id`] to each.
-/// After that, the [`Selector`](crate::Selector) will silently drop the stream.
+/// Used by [`StreamWithIdSelector`](crate::StreamWithIdSelector).
 ///
 /// ```
-/// # use async_selector::{
-/// #     selector::{Id, Selector},
-/// #     task::strategy::StreamWithId,
-/// # };
-/// # use futures::{channel::mpsc, StreamExt};
-/// # #[tokio::main]
+/// use async_selector::StreamWithIdSelector;
+/// use futures::{StreamExt, channel::mpsc};
+///
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
-/// let (tx, rx) = mpsc::unbounded::<i32>();
-/// let mut selector = Selector::<_, StreamWithId>::default();
-/// let id = selector.push(rx).id().clone();
-/// tx.unbounded_send(1).unwrap();
-/// let item: (Id<_>, i32) = selector.next().await.unwrap();
-/// assert_eq!(item.0, id);
-/// assert_eq!(item.1, 1);
-/// drop(tx);
-/// assert!(selector.next().await.is_none());
+/// // Same as `Selector<_, StreamWithId>`.
+/// let mut selector = StreamWithIdSelector::default();
+///
+/// let (tx_a, rx_a) = mpsc::unbounded::<&str>();
+/// let (tx_b, rx_b) = mpsc::unbounded::<&str>();
+/// let id_a = selector.push(rx_a).id().clone();
+/// let id_b = selector.push(rx_b).id().clone();
+///
+/// // Each item comes with the ID of the stream that produced it.
+/// tx_b.unbounded_send("hello").unwrap();
+/// assert_eq!(selector.next().await, Some((id_b, "hello")));
+/// tx_a.unbounded_send("hi").unwrap();
+/// assert_eq!(selector.next().await, Some((id_a, "hi")));
+///
+/// // Closing the channels exhausts the receivers, and the selector drops them.
+/// drop((tx_a, tx_b));
+/// assert_eq!(selector.next().await, None);
 /// assert!(selector.is_empty());
 /// # }
 /// ```
@@ -261,44 +275,53 @@ impl<S: Stream> Task<StreamWithId> for S {
     }
 }
 
-/// Yield stream's items annotated with stream [`Id`], and the exhausted stream itself.
+/// Strategy for [`Stream`]s, which yields their items
+/// paired with the [`Id`] of the stream that produced them,
+/// and then the exhausted streams themselves.
 ///
-/// Enables [`Task`] implementation on any type that implements [`Stream`].
+/// Each stream is polled until it is exhausted.
+/// The selector yields a [`ControlFlow`]:
+/// * `Continue((Id<S>, S::Item))` for every item,
+/// * `Break(Removed<S>)` when the stream is exhausted.
 ///
-/// The stream will be polled for items until it is exhausted.
-/// [`Selector`](crate::Selector) will yield all items, attaching stream's task [`Id`] to each.
-/// After that, the [`Selector`](crate::Selector) will yield the exhausted stream.
+/// Used by [`StreamReclaimSelector`](crate::StreamReclaimSelector).
 ///
 /// ```
-/// # use async_selector::{
-/// #     selector::{Id, Removed, Selector},
-/// #     task::strategy::StreamReclaim,
-/// # };
-/// # use futures::{channel::mpsc, StreamExt};
-/// # use std::ops::ControlFlow;
-/// # #[tokio::main]
+/// use std::ops::ControlFlow;
+///
+/// use async_selector::StreamReclaimSelector;
+/// use futures::{StreamExt, channel::mpsc};
+///
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
-/// let (tx, rx) = mpsc::unbounded::<i32>();
-/// let mut selector = Selector::<_, StreamReclaim>::default();
+/// // Same as `Selector<_, StreamReclaim>`.
+/// let mut selector = StreamReclaimSelector::default();
+///
+/// let (tx, rx) = mpsc::unbounded::<u32>();
 /// let id = selector.push(rx).id().clone();
+///
+/// // Send two items, and close the channel.
 /// tx.unbounded_send(1).unwrap();
-/// match selector.next().await.unwrap() {
-///     ControlFlow::Continue(item) => {
-///         assert_eq!(item.0, id);
-///         assert_eq!(item.1, 1);       
-///     }
-///     ControlFlow::Break(..) => unreachable!("channel is still open"),
-/// }
+/// tx.unbounded_send(2).unwrap();
 /// drop(tx);
-/// match selector.next().await.unwrap() {
-///     ControlFlow::Continue(..) => {
-///         unreachable!("channel was closed");
-///     }
-///     ControlFlow::Break((item)) => {
-///         let rx: mpsc::UnboundedReceiver<i32> = item.into_inner();
+///
+/// let mut items = Vec::new();
+/// while let Some(event) = selector.next().await {
+///     match event {
+///         // The stream produced an item.
+///         ControlFlow::Continue((stream_id, item)) => {
+///             assert_eq!(stream_id, id);
+///             items.push(item);
+///         }
+///         // The stream is exhausted, and we get it back.
+///         ControlFlow::Break(stream) => {
+///             assert_eq!(stream.id(), &id);
+///             let _rx: mpsc::UnboundedReceiver<u32> = stream.into_inner();
+///         }
 ///     }
 /// }
-/// assert!(selector.is_empty());
+///
+/// assert_eq!(items, [1, 2]);
 /// # }
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
@@ -337,37 +360,31 @@ impl<S: Stream> Task<StreamReclaim> for S {
     }
 }
 
-/// Yield stream's items (stopping after first error).
+/// Strategy for [`TryStream`]s, which yields their items and errors.
 ///
-/// Enables [`Task`] implementation on any type that implements [`TryStream`].
+/// Each stream is polled until it is exhausted, or until it yields an error.
+/// The selector yields all of its items and the error (if any),
+/// and then silently drops the stream.
 ///
-/// The stream will be polled for items until it is exhausted or yields an error.
-/// [`Selector`](crate::Selector) will yield all items and the first error.
-/// After that, the [`Selector`](crate::Selector) will silently drop the stream.
+/// Used by [`TryStreamSelector`](crate::TryStreamSelector).
 ///
 /// ```
-/// # use async_selector::{
-/// #     selector::Selector,
-/// #     task::strategy::TryStreamBasic,
-/// # };
-/// # use futures::{channel::mpsc, StreamExt};
-/// # #[tokio::main]
+/// use async_selector::TryStreamSelector;
+/// use futures::StreamExt;
+///
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
-/// let (tx_1, rx_1) = mpsc::unbounded::<Result<i32, &'static str>>();
-/// let (tx_2, rx_2) = mpsc::unbounded::<Result<i32, &'static str>>();
-/// let mut selector = [rx_1, rx_2].into_iter().collect::<Selector::<_, TryStreamBasic>>();
-/// tx_1.unbounded_send(Err("error")).unwrap();
-/// assert_eq!(
-///     selector.next().await.unwrap(),
-///     Err("error"),
-/// );
-/// tx_2.unbounded_send(Ok(1)).unwrap();
-/// assert_eq!(
-///     selector.next().await.unwrap(),
-///     Ok(1),
-/// );
-/// drop(tx_2);
-/// assert!(selector.next().await.is_none());
+/// // Same as `Selector<_, TryStreamBasic>`.
+/// let mut selector = TryStreamSelector::default();
+///
+/// // Two streams of results. The first one fails midway.
+/// selector.push(futures::stream::iter([Ok(1), Err("oops"), Ok(2)]));
+/// selector.push(futures::stream::iter([Ok(10), Ok(20), Ok(30)]));
+///
+/// let items = (&mut selector).collect::<Vec<_>>().await;
+///
+/// // The first stream was dropped after the error, so `Ok(2)` never arrives.
+/// assert_eq!(items, [Ok(1), Ok(10), Err("oops"), Ok(20), Ok(30)]);
 /// assert!(selector.is_empty());
 /// # }
 /// ```
@@ -408,40 +425,48 @@ impl<S: TryStream> Task<TryStreamBasic> for S {
     }
 }
 
-/// Yield stream's items annotated with stream [`Id`] (stopping after first error).
+/// Strategy for [`TryStream`]s, which yields their items and errors
+/// paired with the [`Id`] of the stream that produced them.
 ///
-/// Enables [`Task`] implementation on any type that implements [`TryStream`].
+/// Each stream is polled until it is exhausted, or until it yields an error.
+/// The selector yields all of its items and the error (if any)
+/// as `(Id<S>, Result<S::Ok, S::Error>)` pairs, and then silently drops the stream.
 ///
-/// The stream will be polled for items until it is exhausted or yields an error.
-/// [`Selector`](crate::Selector) will yield all items and the first error,
-/// attaching stream's task [`Id`] to each.
-/// After that, the [`Selector`](crate::Selector) will silently drop the stream.
+/// Used by [`TryStreamWithIdSelector`](crate::TryStreamWithIdSelector).
 ///
 /// ```
-/// # use async_selector::{
-/// #     selector::{Id, Selector},
-/// #     task::strategy::TryStreamWithId,
-/// # };
-/// # use futures::{channel::mpsc, StreamExt};
-/// # #[tokio::main]
+/// use async_selector::TryStreamWithIdSelector;
+/// use futures::StreamExt;
+///
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
-/// let (tx_1, rx_1) = mpsc::unbounded::<Result<i32, &'static str>>();
-/// let (tx_2, rx_2) = mpsc::unbounded::<Result<i32, &'static str>>();
-/// let mut selector = Selector::<_, TryStreamWithId>::default();
-/// let id_1 = selector.push(rx_1).id().clone();
-/// let id_2 = selector.push(rx_2).id().clone();
-/// tx_1.unbounded_send(Err("error")).unwrap();
+/// // Same as `Selector<_, TryStreamWithId>`.
+/// let mut selector = TryStreamWithIdSelector::default();
+///
+/// // Two streams of results. The first one fails midway.
+/// let a = selector
+///     .push(futures::stream::iter([Ok(1), Err("oops"), Ok(2)]))
+///     .id()
+///     .clone();
+/// let b = selector
+///     .push(futures::stream::iter([Ok(10), Ok(20), Ok(30)]))
+///     .id()
+///     .clone();
+///
+/// let items = (&mut selector).collect::<Vec<_>>().await;
+///
+/// // Each item and error comes with the ID of the stream that produced it.
+/// // The first stream was dropped after the error, so `Ok(2)` never arrives.
 /// assert_eq!(
-///     selector.next().await.unwrap(),
-///     (id_1, Err("error")),
+///     items,
+///     [
+///         (a.clone(), Ok(1)),
+///         (b.clone(), Ok(10)),
+///         (a.clone(), Err("oops")),
+///         (b.clone(), Ok(20)),
+///         (b.clone(), Ok(30)),
+///     ],
 /// );
-/// tx_2.unbounded_send(Ok(1)).unwrap();
-/// assert_eq!(
-///     selector.next().await.unwrap(),
-///     (id_2, Ok(1)),
-/// );
-/// drop(tx_2);
-/// assert!(selector.next().await.is_none());
 /// assert!(selector.is_empty());
 /// # }
 /// ```
@@ -485,60 +510,47 @@ impl<S: TryStream> Task<TryStreamWithId> for S {
     }
 }
 
-/// Yield stream's items annotated with stream [`Id`] (stopping after first error),
-/// and the exhausted/failed stream itself.
+/// Strategy for [`TryStream`]s, which yields their items
+/// paired with the [`Id`] of the stream that produced them,
+/// and then the finished streams themselves.
 ///
-/// Enables [`Task`] implementation on any type that implements [`TryStream`].
+/// Each stream is polled until it is exhausted, or until it yields an error.
+/// The selector yields a [`ControlFlow`]:
+/// * `Continue((Id<S>, S::Ok))` for every successful item,
+/// * `Break((Removed<S>, Result<(), S::Error>))` when the stream is exhausted (`Ok(())`)
+///   or yields an error (`Err`).
 ///
-/// The stream will be polled for items until it is exhausted or yields an error.
-/// [`Selector`](crate::Selector) will yield all items and the first error,
-/// attaching stream's task [`Id`] to each.
-/// After that, the [`Selector`](crate::Selector) will yield the exhausted/failed stream.
+/// Used by [`TryStreamReclaimSelector`](crate::TryStreamReclaimSelector).
 ///
 /// ```
-/// # use async_selector::{
-/// #     selector::{Id, Removed, Selector},
-/// #     task::strategy::TryStreamReclaim,
-/// # };
-/// # use futures::{channel::mpsc, StreamExt};
-/// # #[tokio::main]
+/// use std::ops::ControlFlow;
+///
+/// use async_selector::TryStreamReclaimSelector;
+/// use futures::StreamExt;
+///
+/// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
-/// let (tx_1, rx_1) = mpsc::unbounded::<Result<i32, &'static str>>();
-/// let (tx_2, rx_2) = mpsc::unbounded::<Result<i32, &'static str>>();
-/// let mut selector = Selector::<_, TryStreamReclaim>::default();
-/// let id_1 = selector.push(rx_1).id().clone();
-/// let id_2 = selector.push(rx_2).id().clone();
-/// tx_1.unbounded_send(Err("error")).unwrap();
-/// let item: (Removed<_>, Result<_, _>) = selector
-///     .next()
-///     .await
-///     .unwrap()
-///     .break_value()
-///     .unwrap();
-/// assert_eq!(item.0.id(), &id_1);
-/// assert_eq!(
-///     item.1,
-///     Err("error"),
-/// );
-/// tx_2.unbounded_send(Ok(1)).unwrap();
-/// let item: (Id<_>, i32) = selector
-///     .next()
-///     .await
-///     .unwrap()
-///     .continue_value()
-///     .unwrap();
-/// assert_eq!(item.0, id_2);
-/// assert_eq!(item.1, 1);
-/// drop(tx_2);
-/// let item: (Removed<_>, Result<_, _>) = selector
-///     .next()
-///     .await
-///     .unwrap()
-///     .break_value()
-///     .unwrap();
-/// assert_eq!(item.0.id(), &id_2);
-/// assert_eq!(item.1, Ok(()));
-/// assert!(selector.is_empty());
+/// // Same as `Selector<_, TryStreamReclaim>`.
+/// let mut selector = TryStreamReclaimSelector::default();
+///
+/// // Two streams of results. The first one fails midway.
+/// selector.push(futures::stream::iter([Ok(1), Err("oops"), Ok(2)]));
+/// selector.push(futures::stream::iter([Ok(10), Ok(20), Ok(30)]));
+///
+/// let mut items = Vec::new();
+/// let mut endings = Vec::new();
+/// while let Some(event) = selector.next().await {
+///     match event {
+///         // A stream produced an item.
+///         ControlFlow::Continue((_id, item)) => items.push(item),
+///         // A stream failed (`Err`) or was exhausted (`Ok`).
+///         // Either way, we get the stream back.
+///         ControlFlow::Break((_stream, result)) => endings.push(result),
+///     }
+/// }
+///
+/// assert_eq!(items, [1, 10, 20, 30]);
+/// assert_eq!(endings, [Err("oops"), Ok(())]);
 /// # }
 /// ```
 #[derive(Debug, Clone, Copy, Default)]

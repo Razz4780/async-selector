@@ -1,3 +1,10 @@
+//! The [`Task`] trait, which defines how a [`Selector`](crate::selector::Selector)
+//! polls the tasks it holds.
+//!
+//! You don't need anything from this module to use the selector with [`Future`]s and
+//! [`Stream`](futures::Stream)s, the [`strategy`] module has you covered.
+//! Implement [`Task`] yourself when you want to customize the selector's behavior.
+
 use std::{
     ops::ControlFlow,
     pin::Pin,
@@ -8,58 +15,92 @@ use crate::selector::{BorrowedMut, Removed};
 
 pub mod strategy;
 
-/// Asynchronous task that can be polled with strategy `S`.
+/// Asynchronous task that a [`Selector`](crate::selector::Selector) can poll with strategy `S`.
 ///
-/// Strategy parameter allows for:
-/// 1. Convenient blanket implementations on external types ([`Future`]s and [`Stream`](futures::Stream)s)
-/// 2. Multiple implementations on a single type
-/// 3. Exposing shared data to the task
+/// This trait generalizes [`Future`] and [`Stream`](futures::Stream):
+/// a task can produce any number of intermediate values, and then a final one.
 ///
-/// Unless you want to customize [`Selector`](crate::Selector)'s behavior,
-/// you don't have to manually implement this trait.
-/// You can use one of ready-to-go strategies from [`strategy`].
+/// You don't have to implement this trait to use the selector with futures and streams.
+/// The [`strategy`] module provides ready-to-go implementations for them.
 ///
-/// # Custom task example
+/// # How the selector uses a task
 ///
-/// The example below polls a set of [`UdpSocket`](https://docs.rs/tokio/latest/tokio/net/struct.UdpSocket.html)s
+/// Every time the selector polls a task, it calls [`poll_progress`](Self::poll_progress).
+/// Depending on the result:
+///
+/// * [`Poll::Pending`] - the task stays in the selector, and waits for a wakeup.
+/// * `Poll::Ready(ControlFlow::Continue(value))` - the task produced a value, but it's not finished.
+///   It stays in the selector, and it will be polled again.
+///   The selector passes the value to [`transform_cont`](Self::transform_cont),
+///   together with a reference to the task.
+/// * `Poll::Ready(ControlFlow::Break(value))` - the task is finished.
+///   The selector removes it, and passes the value to [`transform_break`](Self::transform_break),
+///   together with the removed task.
+///
+/// The transform methods turn the value into the item that the selector yields ([`Output`](Self::Output)).
+/// If they return [`None`], the selector yields nothing for this value, and moves on.
+///
+/// # The strategy parameter
+///
+/// The strategy `S` is a value stored in the selector.
+/// The selector passes it by mutable reference to every method of this trait.
+/// This allows for:
+/// 1. **Sharing state between all tasks**, e.g. a buffer, a configuration, or some statistics.
+///    No synchronization or `unsafe` code is needed, because the selector polls one task at a time.
+/// 2. **Multiple implementations for a single type**,
+///    e.g. one for reading data, and another one for a graceful shutdown.
+///    You can switch between them with [`Selector::with_strategy`](crate::selector::Selector::with_strategy).
+/// 3. **Implementations for foreign types.** A local strategy type lets you implement
+///    this trait for types from other crates. This is how the [`strategy`] module implements it
+///    for all [`Future`]s and [`Stream`](futures::Stream)s.
+///
+/// If you don't need any of this, use `()` as the strategy (it's the default).
+///
+/// This trait is also implemented for the `&mut S` and `Box<S>` strategies,
+/// whenever it is implemented for `S`.
+///
+/// # Example
+///
+/// The example below polls a set of tokio's
+/// [`UdpSocket`](https://docs.rs/tokio/latest/tokio/net/struct.UdpSocket.html)s
 /// for incoming datagrams.
 ///
 /// Note that:
-/// 1. [`UdpSocket`](https://docs.rs/tokio/latest/tokio/net/struct.UdpSocket.html) is an external type,
-///    and so is this trait (from the perspective of the implementing crate).
-///    The local strategy type makes the implementation possible.
+/// 1. `UdpSocket` is a foreign type, and so is this trait (from the perspective of the example).
+///    The local `RecvBuffer` strategy type makes the implementation possible.
 /// 2. The strategy holds the receive buffer, so the whole selector needs only one,
-///    no matter how many sockets it holds. Each datagram is copied out of the shared buffer
-///    in [`Task::transform_cont`], before the next poll can overwrite it.
-/// 3. A failed socket is removed from the selector, because the failure is reported
+///    no matter how many sockets it holds.
+///    Each datagram is copied out of the shared buffer in [`transform_cont`](Self::transform_cont),
+///    before the next poll can overwrite it.
+/// 3. A failing socket is removed from the selector, because the failure is reported
 ///    with [`ControlFlow::Break`].
 ///
 /// ```
-/// # use std::{
-/// #     io,
-/// #     mem::MaybeUninit,
-/// #     net::SocketAddr,
-/// #     ops::ControlFlow,
-/// #     pin::Pin,
-/// #     task::{Context, Poll, ready},
-/// # };
-/// # use async_selector::{
-/// #     selector::{BorrowedMut, Removed, Selector},
-/// #     task::Task,
-/// # };
-/// # use futures::StreamExt;
-/// # use tokio::{io::ReadBuf, net::UdpSocket};
-/// /// Receive buffer shared by all sockets in the selector.
-/// ///
-/// /// Large enough to hold any datagram.
-/// struct RecvBuffer(Box<[MaybeUninit<u8>; u16::MAX as usize]>);
+/// use std::{
+///     io,
+///     net::SocketAddr,
+///     ops::ControlFlow,
+///     pin::Pin,
+///     task::{Context, Poll, ready},
+/// };
+///
+/// use async_selector::{
+///     selector::{BorrowedMut, Removed, Selector},
+///     task::Task,
+/// };
+/// use futures::StreamExt;
+/// use tokio::{io::ReadBuf, net::UdpSocket};
+///
+/// /// Strategy holding a receive buffer that is shared by all sockets in the selector.
+/// struct RecvBuffer(Vec<u8>);
 ///
 /// impl Task<RecvBuffer> for UdpSocket {
-///     /// Address of the peer and length of the datagram,
+///     /// Address of the peer and length of the received datagram,
 ///     /// which sits in the shared buffer.
-///     type Cont = (SocketAddr, Vec<u8>);
-///     /// Fatal socket error.
+///     type Cont = (SocketAddr, usize);
+///     /// Socket error. The socket is removed from the selector after it fails.
 ///     type Break = io::Error;
+///     /// What the selector yields: received datagrams and socket errors.
 ///     type Output = io::Result<(SocketAddr, Vec<u8>)>;
 ///
 ///     fn poll_progress(
@@ -67,33 +108,40 @@ pub mod strategy;
 ///         buffer: &mut RecvBuffer,
 ///         cx: &mut Context<'_>,
 ///     ) -> Poll<ControlFlow<Self::Break, Self::Cont>> {
-///         let mut buf = ReadBuf::uninit(buffer.0.as_mut_slice());
-///         match ready!(self.poll_recv_from(cx, &mut buf)) {
-///             Ok(peer) => Poll::Ready(ControlFlow::Continue((peer, buf.filled().to_vec()))),
-///             Err(error) => Poll::Ready(ControlFlow::Break(error)),
-///         }
+///         // Receive the next datagram into the shared buffer.
+///         let mut buf = ReadBuf::new(&mut buffer.0);
+///         let flow = match ready!(self.poll_recv_from(cx, &mut buf)) {
+///             Ok(peer) => ControlFlow::Continue((peer, buf.filled().len())),
+///             Err(error) => ControlFlow::Break(error),
+///         };
+///         Poll::Ready(flow)
 ///     }
 ///
 ///     fn transform_cont(
-///         _: BorrowedMut<'_, Self>,
+///         _socket: BorrowedMut<'_, Self>,
 ///         buffer: &mut RecvBuffer,
-///         value: Self::Cont,
+///         (peer, len): Self::Cont,
 ///     ) -> Option<Self::Output> {
-///         Some(Ok(value))
+///         // Copy the datagram out of the shared buffer.
+///         Some(Ok((peer, buffer.0[..len].to_vec())))
 ///     }
 ///
 ///     fn transform_break(
-///         _: Removed<Self>,
-///         _: &mut RecvBuffer,
+///         _socket: Removed<Self>,
+///         _buffer: &mut RecvBuffer,
 ///         error: Self::Break,
 ///     ) -> Option<Self::Output> {
+///         // We don't need the failed socket anymore, so we let it drop.
 ///         Some(Err(error))
 ///     }
 /// }
 ///
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() -> io::Result<()> {
-/// let mut selector = Selector::new(RecvBuffer(Box::new([MaybeUninit::uninit(); u16::MAX as usize])));
+/// // A single buffer, large enough for any datagram, serves all sockets.
+/// let mut selector = Selector::new(RecvBuffer(vec![0; u16::MAX as usize]));
+///
+/// // Bind a couple of sockets, and push them into the selector.
 /// let mut addrs = Vec::new();
 /// for _ in 0..2 {
 ///     let socket = UdpSocket::bind("127.0.0.1:0").await?;
@@ -101,6 +149,7 @@ pub mod strategy;
 ///     selector.push(socket);
 /// }
 ///
+/// // Send a datagram to each socket, and receive it through the selector.
 /// let sender = UdpSocket::bind("127.0.0.1:0").await?;
 /// for addr in &addrs {
 ///     sender.send_to(b"hello", addr).await?;
@@ -112,48 +161,68 @@ pub mod strategy;
 /// # }
 /// ```
 pub trait Task<S: ?Sized = ()>: Sized {
-    /// Type returned from [`Self::poll_progress`]
-    /// when the task produces some value, but has not finished yet.
+    /// Value returned from [`poll_progress`](Self::poll_progress)
+    /// when the task produces a value, but is not finished yet.
+    ///
+    /// Passed to [`transform_cont`](Self::transform_cont).
     type Cont;
-    /// Type returned from [`Self::poll_progress`]
-    /// when the task produces its last value.
+
+    /// Value returned from [`poll_progress`](Self::poll_progress)
+    /// when the task finishes.
+    ///
+    /// Passed to [`transform_break`](Self::transform_break).
     type Break;
-    /// Final value type, produced from [`Self::Cont`]/[`Self::Break`]
-    /// in [`Self::transform_cont`]/[`Self::transform_break`].
+
+    /// Item yielded by the selector.
+    ///
+    /// Produced from [`Cont`](Self::Cont) and [`Break`](Self::Break) values by
+    /// [`transform_cont`](Self::transform_cont) and [`transform_break`](Self::transform_break).
     type Output;
 
-    /// Polls progress on this task using the given strategy.
+    /// Attempts to make progress on this task.
+    ///
+    /// Works like [`Future::poll`] and [`Stream::poll_next`](futures::Stream::poll_next):
+    /// if the task cannot make progress yet, it returns [`Poll::Pending`],
+    /// and arranges for the waker from `cx` to be woken when it can.
     ///
     /// # Returns
     ///
-    /// * [`ControlFlow::Break`], if task has finished,
-    ///   and **should not** be polled again.
-    /// * [`ControlFlow::Continue`], if the task has produced a value,
-    ///   but has not finished yet and **can** be polled again.
+    /// * [`Poll::Pending`] if the task cannot make progress yet.
+    /// * `Poll::Ready(ControlFlow::Continue(value))` if the task produced a value,
+    ///   but has not finished yet, and **can** be polled again.
+    /// * `Poll::Ready(ControlFlow::Break(value))` if the task has finished,
+    ///   and **must not** be polled again.
+    ///   The selector removes the task before passing the value to
+    ///   [`transform_break`](Self::transform_break).
     fn poll_progress(
         self: Pin<&mut Self>,
         strategy: &mut S,
         cx: &mut Context<'_>,
     ) -> Poll<ControlFlow<Self::Break, Self::Cont>>;
 
-    /// Transforms [`Self::Cont`] value obtained from [`Self::poll_progress`]
-    /// into the final value type [`Self::Output`].
+    /// Turns a [`Cont`](Self::Cont) value returned from [`poll_progress`](Self::poll_progress)
+    /// into the item yielded by the selector.
     ///
+    /// The task is still stored in the selector, and you get a mutable reference to it.
     /// This is the place to:
-    /// 1. Enrich the value with some properties of the task, passed as [`BorrowedMut`]
-    /// 2. Silently ignore the value by returning [`None`]
+    /// 1. enrich the value with some properties of the task, e.g. its [`Id`](crate::selector::Id),
+    /// 2. update the task's state,
+    /// 3. skip the value by returning [`None`] (the selector yields nothing for it).
     fn transform_cont(
         task: BorrowedMut<'_, Self>,
         strategy: &mut S,
         value: Self::Cont,
     ) -> Option<Self::Output>;
 
-    /// Transforms [`Self::Break`] value obtained from [`Self::poll_progress`]
-    /// into the final value type [`Self::Output`].
+    /// Turns a [`Break`](Self::Break) value returned from [`poll_progress`](Self::poll_progress)
+    /// into the item yielded by the selector.
     ///
+    /// The task has already been removed from the selector, and you own it.
     /// This is the place to:
-    /// 1. Enrich the value with some properties of the task, passed as [`Removed`]
-    /// 2. Silently ignore the value by returning [`None`]
+    /// 1. enrich the value with some properties of the task, e.g. its [`Id`](crate::selector::Id),
+    /// 2. give the task back to the caller as part of the output,
+    ///    or let it drop together with the [`Removed`] handle,
+    /// 3. skip the value by returning [`None`] (the selector yields nothing for it).
     fn transform_break(
         task: Removed<Self>,
         strategy: &mut S,

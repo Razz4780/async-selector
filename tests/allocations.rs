@@ -55,7 +55,7 @@ const TASKS: usize = 64;
 const ITEMS_PER_TASK: usize = 64;
 
 /// Drains the stream, and returns the number of allocations made while draining.
-/// 
+///
 /// Verifies the number of items drained from the stream.
 fn allocations_while_draining<S: Stream + Unpin>(mut stream: S, expected_items: usize) -> usize {
     let driver = Driver::default();
@@ -71,7 +71,10 @@ fn stream_selector_ready_streams() {
     let selector = (0..TASKS)
         .map(|_| ReadyStream::new(ITEMS_PER_TASK))
         .collect::<StreamSelector<_>>();
-    assert_eq!(allocations_while_draining(selector, TASKS * ITEMS_PER_TASK), 0);
+    assert_eq!(
+        allocations_while_draining(selector, TASKS * ITEMS_PER_TASK),
+        0
+    );
 }
 
 #[test]
@@ -79,7 +82,10 @@ fn stream_selector_yield_streams() {
     let selector = (0..TASKS)
         .map(|_| YieldStream::new(ITEMS_PER_TASK))
         .collect::<StreamSelector<_>>();
-    assert_eq!(allocations_while_draining(selector, TASKS * ITEMS_PER_TASK), 0);
+    assert_eq!(
+        allocations_while_draining(selector, TASKS * ITEMS_PER_TASK),
+        0
+    );
 }
 
 #[test]

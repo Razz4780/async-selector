@@ -27,11 +27,10 @@ use futures::{
 };
 use tokio_stream::StreamMap;
 
+use crate::common::ITEMS_PER_TASK;
+
 /// Number of tasks in one selector instance.
 const TASKS: usize = 1024;
-
-/// Number of items produced by one task.
-const ITEMS_PER_TASK: usize = 64;
 
 /// Thread counts to benchmark: powers of two up to the available parallelism,
 /// and the available parallelism itself.

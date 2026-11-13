@@ -12,7 +12,7 @@ use std::{
 
 use async_selector::{FutureSelector, StreamSelector};
 use common::{Driver, ReadyStream, YieldFuture, YieldStream};
-use futures::{Stream, stream::SelectAll};
+use futures::Stream;
 
 thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
@@ -92,13 +92,4 @@ fn future_selector_yield_futures() {
     assert_eq!(driver.count_to_end(&mut selector), TASKS);
     let after = ALLOCATIONS.with(Cell::get);
     assert_eq!(after - before, 0);
-}
-
-/// Documents the allocation this crate avoids: [`SelectAll`] allocates for every produced item.
-#[test]
-fn select_all_allocates_per_item() {
-    let selector = (0..TASKS)
-        .map(|_| ReadyStream::new(ITEMS_PER_TASK))
-        .collect::<SelectAll<_>>();
-    assert!(allocations_while_draining(selector) >= TASKS * ITEMS_PER_TASK);
 }

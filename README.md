@@ -81,13 +81,15 @@ Selected results, obtained with:
 | Benchmark | `async-selector` | `futures 0.3.34` | `tokio-stream 0.1.19`<sup>1, 2</sup> |
 |---|---|---|---|
 | `ready_streams`: 1k streams, 64 immediately ready items each | `StreamSelector` 1.14 ms | `SelectAll` 3.53 ms (3.1x) | `StreamMap` 143 µs (0.13x) |
+| `parallel/ready_streams`: like `ready_streams`, 32 instances on 32 threads (time per instance) | `StreamSelector` 1.62 ms | `SelectAll` 6.31 ms (3.9x) | `StreamMap` 287 µs (0.18x) |
 | `yield_streams`: 1k streams, 64 items each, self-wake before each item | `StreamSelector` 2.58 ms | `SelectAll` 6.71 ms (2.6x) | `StreamMap` 787 µs (0.31x) |
+| `parallel/yield_streams`: like `yield_streams`, 32 instances on 32 threads (time per instance) | `StreamSelector` 4.17 ms | `SelectAll` 12.2 ms (2.9x) | `StreamMap` 1.28 ms (0.31x) |
 | `yield_futures`: 1k futures, each self-waking 64 times | `FutureSelector` 1.44 ms | `FuturesUnordered` 3.14 ms (2.2x) | `StreamMap` 205 µs (0.14x) |
+| `parallel/yield_futures`: like `yield_futures`, 32 instances on 32 threads (time per instance) | `FutureSelector` 2.67 ms | `FuturesUnordered` 5.71 ms (2.1x) | `StreamMap` 279 µs (0.10x) |
 | `ready_futures`: push and resolve 1k ready futures | `FutureSelector` 50.9 µs | `FuturesUnordered` 70.5 µs (1.4x) | `StreamMap` 117 µs (2.3x) |
 | `churn`: 1k short-lived futures in flight, 16k completions | `FutureSelector` 2.07 ms | `FuturesUnordered` 3.90 ms (1.9x) | `StreamMap` 4.33 ms (2.1x) |
 | `sparse_wakeups`: wake and drain 1 of 16k idle streams | `StreamSelector` 108 ns | `SelectAll` 191 ns (1.8x) | `StreamMap` 612 µs (5600x) |
 | `cross_thread`: 4 threads wake 1k streams, drained concurrently | `StreamSelector` 114 µs | `SelectAll` 230 µs (2.0x) | `StreamMap` 411 µs (3.6x) |
-| `parallel/ready_streams`: like `ready_streams`, 32 instances on 32 threads (time per instance) | `StreamSelector` 1.62 ms | `SelectAll` 6.31 ms (3.9x) | `StreamMap` 287 µs (0.18x) |
 | `remove_all`: remove 4k idle streams in random order | `StreamSelector` 34.8 µs | `SelectAll` + `Abortable` 333 µs (9.6x) | `StreamMap` 777 µs (22x) |
 
 1. When holding futures, `StreamMap` wraps them with `futures::stream::once`.

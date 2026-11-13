@@ -12,7 +12,7 @@ use std::{
 
 use async_selector::{FutureSelector, StreamSelector};
 use common::{Driver, ReadyStream, YieldFuture, YieldStream};
-use futures::{Stream, stream::SelectAll};
+use futures::Stream;
 
 thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
@@ -55,12 +55,14 @@ const TASKS: usize = 64;
 const ITEMS_PER_TASK: usize = 64;
 
 /// Drains the stream, and returns the number of allocations made while draining.
-fn allocations_while_draining<S: Stream + Unpin>(mut stream: S) -> usize {
+///
+/// Verifies the number of items drained from the stream.
+fn allocations_while_draining<S: Stream + Unpin>(mut stream: S, expected_items: usize) -> usize {
     let driver = Driver::default();
     let before = ALLOCATIONS.with(Cell::get);
     let items = driver.count_to_end(&mut stream);
     let after = ALLOCATIONS.with(Cell::get);
-    assert_eq!(items, TASKS * ITEMS_PER_TASK);
+    assert_eq!(items, expected_items);
     after - before
 }
 
@@ -69,7 +71,10 @@ fn stream_selector_ready_streams() {
     let selector = (0..TASKS)
         .map(|_| ReadyStream::new(ITEMS_PER_TASK))
         .collect::<StreamSelector<_>>();
-    assert_eq!(allocations_while_draining(selector), 0);
+    assert_eq!(
+        allocations_while_draining(selector, TASKS * ITEMS_PER_TASK),
+        0
+    );
 }
 
 #[test]
@@ -77,7 +82,10 @@ fn stream_selector_yield_streams() {
     let selector = (0..TASKS)
         .map(|_| YieldStream::new(ITEMS_PER_TASK))
         .collect::<StreamSelector<_>>();
-    assert_eq!(allocations_while_draining(selector), 0);
+    assert_eq!(
+        allocations_while_draining(selector, TASKS * ITEMS_PER_TASK),
+        0
+    );
 }
 
 #[test]
@@ -85,20 +93,5 @@ fn future_selector_yield_futures() {
     let selector = (0..TASKS)
         .map(|_| YieldFuture::new(ITEMS_PER_TASK))
         .collect::<FutureSelector<_>>();
-    // Each future produces one item.
-    let driver = Driver::default();
-    let mut selector = selector;
-    let before = ALLOCATIONS.with(Cell::get);
-    assert_eq!(driver.count_to_end(&mut selector), TASKS);
-    let after = ALLOCATIONS.with(Cell::get);
-    assert_eq!(after - before, 0);
-}
-
-/// Documents the allocation this crate avoids: [`SelectAll`] allocates for every produced item.
-#[test]
-fn select_all_allocates_per_item() {
-    let selector = (0..TASKS)
-        .map(|_| ReadyStream::new(ITEMS_PER_TASK))
-        .collect::<SelectAll<_>>();
-    assert!(allocations_while_draining(selector) >= TASKS * ITEMS_PER_TASK);
+    assert_eq!(allocations_while_draining(selector, TASKS), 0);
 }

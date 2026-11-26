@@ -791,18 +791,14 @@ mod test {
             };
 
             unsafe { queue.enqueue_all(nodes[..2].iter().map(Arc::as_ptr)) };
+            // Dequeue only after both are done. Otherwise the shared node
+            // could be legitimately enqueued for the second time.
+            sender.join().unwrap();
+
             let mut values = Vec::new();
-            while values.len() < 3 {
-                let Some(node) = receiver.dequeue() else {
-                    loom::thread::yield_now();
-                    continue;
-                };
+            while let Some(node) = receiver.dequeue() {
                 values.push(*unsafe { node.into_live() }.unwrap().value());
             }
-
-            sender.join().unwrap();
-            assert!(receiver.dequeue().is_none());
-
             values.sort_unstable();
             assert_eq!(values, [0, 1, 2]);
 
@@ -1176,6 +1172,7 @@ mod test {
         assert!(queue.park(Waker::noop()));
         let waker_owner = Arc::new(());
         struct Owned(#[allow(dead_code)] Arc<()>);
+        #[allow(clippy::manual_noop_waker)] // the waker must own a reference
         impl Wake for Owned {
             fn wake(self: Arc<Self>) {}
         }

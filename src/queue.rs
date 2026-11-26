@@ -211,9 +211,11 @@ impl<T> Receiver<T> {
         let mut node = newest;
         let mut newer = std::ptr::null_mut();
         let oldest = loop {
-            let older = unsafe { &*node }
-                .next_enqueued
-                .swap(newer, Ordering::Relaxed);
+            // Load and store, not `swap`: the receiver has exclusive access to the link,
+            // and an atomic swap is a locked instruction on x86.
+            let link = &unsafe { &*node }.next_enqueued;
+            let older = link.load(Ordering::Relaxed);
+            link.store(newer, Ordering::Relaxed);
             if older.is_null() {
                 break node;
             }

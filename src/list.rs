@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::queue::{self, Queue};
+use crate::queue::{self, Receiver};
 
 /// Instrusive doubly-linked list of [`Node`]s.
 ///
@@ -40,10 +40,10 @@ impl<T> List<T> {
     /// Returns a mutable reference to the value.
     pub fn push_back<'a>(
         &'a mut self,
-        queue: &Arc<Queue<ListProtected<T>>>,
+        queue: &mut Receiver<ListProtected<T>>,
         value: T,
     ) -> Borrowed<&'a mut T> {
-        let node = queue.create_enqueued(ListProtected {
+        let node = queue.queue().create_enqueued(ListProtected {
             next: UnsafeCell::new(std::ptr::null()),
             prev: UnsafeCell::new(std::ptr::null()),
             value: UnsafeCell::new(ManuallyDrop::new(value)),
@@ -548,13 +548,13 @@ mod test {
 
     #[test]
     fn list_drops_values_on_drop() {
-        let queue = Receiver::default();
+        let mut queue = Receiver::default();
         let mut list = List::default();
 
         let nodes = std::iter::repeat_with(|| {
             let node = Arc::new(());
             let weak = Arc::downgrade(&node);
-            list.push_back(queue.queue(), node);
+            list.push_back(&mut queue, node);
             weak
         })
         .take(4)
@@ -581,7 +581,7 @@ mod test {
             }
         }
 
-        let queue = Receiver::default();
+        let mut queue = Receiver::default();
         let mut list = List::default();
 
         let nodes = std::iter::repeat_n(false, 10)
@@ -590,7 +590,7 @@ mod test {
             .map(|should_panic| {
                 let node = Arc::new(Node(should_panic));
                 let weak = Arc::downgrade(&node);
-                list.push_back(queue.queue(), node);
+                list.push_back(&mut queue, node);
                 weak
             })
             .collect::<Vec<_>>();
@@ -609,10 +609,10 @@ mod test {
 
     #[test]
     fn list_allows_node_access() {
-        let queue = Receiver::default();
+        let mut queue = Receiver::default();
         let mut list = List::default();
 
-        let node = list.push_back(queue.queue(), 0);
+        let node = list.push_back(&mut queue, 0);
         assert_eq!(*node.get_pin(), 0);
 
         let node = node.node().clone();
@@ -640,11 +640,11 @@ mod test {
 
     #[test]
     fn cursor_order() {
-        let queue = Receiver::default();
+        let mut queue = Receiver::default();
         let mut list = List::default();
 
         for i in 0..10 {
-            list.push_back(queue.queue(), i);
+            list.push_back(&mut queue, i);
         }
 
         let mut cursor = list.cursor();
@@ -675,11 +675,11 @@ mod test {
 
     #[test]
     fn cursor_mut_order() {
-        let queue = Receiver::default();
+        let mut queue = Receiver::default();
         let mut list = List::default();
 
         for i in 0..10 {
-            list.push_back(queue.queue(), i);
+            list.push_back(&mut queue, i);
         }
 
         let mut cursor = list.cursor_mut();
@@ -714,11 +714,11 @@ mod test {
 
     #[test]
     fn removal_with_cursor_mut() {
-        let queue = Receiver::default();
+        let mut queue = Receiver::default();
         let mut list = List::default();
 
         for i in 0_u32..10 {
-            list.push_back(queue.queue(), i);
+            list.push_back(&mut queue, i);
         }
 
         let mut cursor = list.cursor_mut();

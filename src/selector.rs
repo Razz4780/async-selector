@@ -16,7 +16,7 @@ use std::{
     ops::{ControlFlow, Index, IndexMut, Not},
     pin::Pin,
     rc::Rc,
-    sync::{Arc, Weak},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -212,7 +212,7 @@ impl<T, S> Selector<T, S> {
     /// assert!(selector.contains(&id));
     /// ```
     pub fn push(&mut self, task: T) -> BorrowedMut<'_, T> {
-        BorrowedMut(self.tasks.list.push_back(self.tasks.queue.queue(), task))
+        BorrowedMut(self.tasks.list.push_back(&mut self.tasks.queue, task))
     }
 
     /// Returns the number of tasks stored in the selector.
@@ -550,17 +550,18 @@ impl<T, S> Selector<T, S> {
     /// (see [wakeups](Self#wakeups)).
     /// To wake a single task, use [`Id::wake`].
     pub fn wake_all(&self) {
-        let queue = self.tasks.queue.queue();
-        self.iter().for_each(|task| unsafe {
-            // SAFETY: the task was created from this queue.
-            queue.enqueue_silent(task.id().get());
-        });
-        queue.notify();
+        let mut cursor = self.tasks.list.cursor();
+        let nodes = std::iter::from_fn(|| Some(Arc::as_ptr(cursor.pop_front()?.node())));
+        unsafe {
+            // SAFETY: the tasks were created from this queue,
+            // and `self` keeps the receiver alive.
+            self.tasks.queue.queue().enqueue_all(nodes);
+        }
     }
 
     fn created(&self, task: &Node<T>) -> bool {
         let this_queue_ptr = Arc::as_ptr(self.tasks.queue.queue());
-        let task_queue_ptr = Weak::as_ptr(task.queue());
+        let task_queue_ptr = Arc::as_ptr(task.queue());
         this_queue_ptr == task_queue_ptr
     }
 }

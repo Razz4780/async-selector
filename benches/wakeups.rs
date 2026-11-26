@@ -80,6 +80,25 @@ fn bench_sparse<S, F>(
     });
 }
 
+/// Hold `n` idle streams, wake all of them, and drain the selector.
+///
+/// The opposite of [`sparse_wakeups`]: the selector receives its whole wakeup queue as one batch.
+fn bulk_wakeups(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bulk_wakeups");
+
+    for n in SIZES {
+        group.throughput(Throughput::Elements(n as u64));
+        bench_sparse(&mut group, "StreamSelector", n, n, |streams| {
+            streams.collect::<StreamSelector<_>>()
+        });
+        bench_sparse(&mut group, "SelectAll", n, n, |streams| {
+            streams.collect::<SelectAll<_>>()
+        });
+    }
+
+    group.finish();
+}
+
 /// Hold [`STREAMS`] idle streams. In each round, `p` producer threads send one notification
 /// to every stream, while the consumer drains the selector concurrently.
 ///
@@ -189,6 +208,6 @@ where
 criterion_group! {
     name = benches;
     config = common::config();
-    targets = sparse_wakeups, cross_thread
+    targets = sparse_wakeups, bulk_wakeups, cross_thread
 }
 criterion_main!(benches);

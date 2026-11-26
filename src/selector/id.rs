@@ -1,7 +1,4 @@
-use std::{
-    fmt, hash,
-    sync::{Arc, Weak},
-};
+use std::{fmt, hash, sync::Arc};
 
 use crate::list::Node;
 
@@ -89,7 +86,7 @@ impl<C> fmt::Debug for Id<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Id")
             .field("task_ptr", &Arc::as_ptr(&self.0))
-            .field("queue_ptr", &Weak::as_ptr(self.0.queue()))
+            .field("queue_ptr", &Arc::as_ptr(self.0.queue()))
             .finish()
     }
 }
